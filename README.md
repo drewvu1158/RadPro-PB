@@ -30,12 +30,29 @@ like a booth at a wedding or party.
   retain the original camera orientation.
 - 1–8 shots per session (default 4)
 - Composes a classic vertical photo strip or a 2×2 grid with a border
-- **Layout studio**: import/export `.sbl`, drag photo placements, edit canvas
-  size, photo size/position/rotation, stacking and shot numbers; add PNG/JPEG
-  backgrounds and transparent overlays. Includes original strip, double-strip,
-  and 4×6 grid presets. **Apply to booth** saves a separate active copy.
+- **Layout studio**: a three-pane designer with editable text, PNG/JPEG images,
+  photo placements, and rectangle, ellipse, heart, star, and diamond shapes.
+  Resize with corner handles, rotate with the round handle, or enter exact
+  positions, sizes and angles. Includes a front-to-back layer list with
+  visibility, locking, duplication, deletion and stacking controls.
+- **Typography**: multiline text with wrapping, Sans/Serif/Mono typefaces, size,
+  alignment, bold, italic, tracking, line height, color and opacity. Sans and
+  Mono are bundled fonts; Serif uses the host's Georgia font when available
+  and falls back to Sans. Complex-script shaping and custom font import are
+  not implemented.
+- **Artwork styling**: image contain/cover/stretch modes, flips, opacity,
+  rounded corners and borders; editable shape fills and borders. The base
+  background supports solid color, linear/radial gradients, dots and checks,
+  with eight color palettes and custom color pickers.
+- **Ten original premade templates**: Editorial, After Hours, Garden Party,
+  Pop Club, Golden Hour, Made of Memories, Electric Night, Birthday Wishes,
+  Modern Love, and Less Is More. Every element is editable. Blank strip,
+  double-strip and 4×6 grid layouts are also available.
+- **History and precision**: undo/redo (40 steps), canvas alignment, grid,
+  zoom, clean preview, keyboard nudging and snapping. **Save .sbl** preserves
+  editable layers; **Apply to booth** saves a separate active copy.
 - **Alignment guides** mark matching edges and centers of photo boxes and the
-  canvas while dragging, including the visible bounds of rotated boxes. Boxes
+  canvas while dragging, including the visible bounds of rotated layers. Layers
   snap within six screen points, regardless of zoom. Hold **Shift** to move
   freely, or turn off **Snap to guides**. Guides disappear on release.
 - **Photo review**: browse the finished layout and each captured photo.
@@ -100,14 +117,49 @@ rotation, and embedded `backgroundimage`/`overlayimage` bytes. The captured
 photo count follows the highest referenced shot number, rather than the
 number of boxes. Original files are never modified by import or Apply.
 Export writes the same v2 AMF3 structure and preserves unedited metadata.
+Radiate designs store their editable layer stack in a versioned
+`radiate_design` extension and embed flattened background/overlay PNGs with
+the ordinary photo placements for other SBL readers. Arbitrary artwork/photo
+interleaving is projected into those PNGs using photo coverage. Flattened
+alpha compositing can differ by a few color levels due to 8-bit rounding;
+reopening in Radiate retains the original editable composition. Photo frames
+are opaque rectangles, matching the SBL photo model. Image and shape layers
+can have rounded corners and transparency.
 Opening exported files in the original Sparkbooth application has not been
 verified. JSON layout files and other SBL versions are not supported.
 
-Separate `texts` or `images` layers are currently rejected with an explanation;
-flatten those into a background/overlay in Sparkbooth before exporting. Missing
+Separate text/image layers encoded by Sparkbooth are still rejected with an
+explanation; flatten those into a background/overlay in Sparkbooth before
+exporting. Radiate-created text/image layers remain fully editable. Missing
 external artwork is reported rather than fetched or silently omitted. Files
 are limited to 32 MiB, canvas/artwork to 16 megapixels and 8192 pixels per side,
-with 1–64 placements referencing shots 1–8. These bound decoded image memory.
+with 1–64 photo placements referencing shots 1–8, 128 total layers, and a
+combined decoded image-layer budget of 32 megapixels. Text is limited to 4096
+UTF-8 bytes per layer. These bound decoded memory and document complexity.
+
+## Designing a layout
+
+Open **Layout studio**, then **Templates / Presets** to choose a starter.
+Use **+ Photo**, **+ Text**, **+ Image**, or **+ Shape** to add elements.
+Select an element on the canvas or in **Layers**; the right inspector exposes
+its content, geometry and styling. The layer at the top of the list is in
+front. Lock a background or decoration to keep it out of canvas selection.
+
+The **Canvas** tab controls dimensions, base background, patterns and palettes.
+**Background image** adds an ordinary image layer behind the other elements.
+Use the inspector to change any image's crop mode or replace its source.
+Hide **Outlines** for a clean preview. All artwork is embedded on save.
+
+Drag to move, use corner squares to resize, and use the round handle to
+rotate. Hold **Shift** to bypass movement snapping, keep the original aspect
+ratio while resizing, or snap rotation to 15-degree increments. Arrow keys
+nudge one pixel; Shift+arrow nudges ten. Ctrl+D duplicates, Delete removes,
+Ctrl+Z undoes, Ctrl+Y redoes, and Ctrl+S opens Save. Keyboard shortcuts leave
+text fields' normal editing behavior intact.
+
+Changing presets and importing files can be undone. Changes remain a draft
+until **Apply to booth**. Save a `.sbl` to keep a design for later; drafts are
+not autosaved on app exit. Overwritten files receive timestamped backups.
 
 Format inspection and compatibility checks use two publicly shared templates
 from [A1 Photo Booth's sharing library](https://www.a1photobooth.com/SB/), linked
@@ -172,7 +224,7 @@ select an isolated configuration for testing or a separate booth setup.
 
 Deliberately not included in v0.1. Ideas for later:
 
-- Separate editable text/graphic layers inside imported SBL files
+- Native decoding of Sparkbooth's separate text/graphic layer encoding
 - Sound effects and voice countdowns
 - Direct dye-sub cutter control and automatic printer setup
 - GIF/animated output, cloud upload/sharing

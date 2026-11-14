@@ -9,7 +9,7 @@ pub fn choose(save: bool, artwork: bool) -> Result<Option<PathBuf>, String> {
         let filter: Vec<u16> = if artwork {
             "Images (PNG, JPEG)\0*.png;*.jpg;*.jpeg\0\0"
         } else {
-            "Sparkbooth layout (*.sbl)\0*.sbl\0\0"
+            "Photobooth layout (*.sbl)\0*.sbl\0\0"
         }
         .encode_utf16()
         .collect();

@@ -59,17 +59,17 @@ pub fn align_drag(
     if !enabled {
         return result;
     }
-    let slot = &template.slots[selected];
+    let slot = &template.layers[selected].frame;
     let bounds = slot
         .bounds()
         .translated(requested.0 - slot.x, requested.1 - slot.y);
     let mut xs = vec![template.width as f64 * 0.5, 0.0, template.width as f64];
     let mut ys = vec![template.height as f64 * 0.5, 0.0, template.height as f64];
-    for (i, other) in template.slots.iter().enumerate() {
-        if i == selected {
+    for (i, other) in template.layers.iter().enumerate() {
+        if i == selected || !other.visible {
             continue;
         }
-        let b = other.bounds();
+        let b = other.frame.bounds();
         xs.extend(b.x_anchors());
         ys.extend(b.y_anchors());
     }
@@ -86,15 +86,15 @@ pub fn align_drag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template::PhotoSlot;
+    use crate::design::{Frame, Layer};
 
     fn scene() -> Template {
         let mut t = Template::builtin(false);
         t.width = 1000;
         t.height = 800;
-        t.slots = vec![
-            PhotoSlot::new(90.0, 100.0, 100.0, 80.0, 0),
-            PhotoSlot::new(300.0, 400.0, 100.0, 80.0, 1),
+        t.layers = vec![
+            Layer::photo(Frame::new(90.0, 100.0, 100.0, 80.0), 0),
+            Layer::photo(Frame::new(300.0, 400.0, 100.0, 80.0), 1),
         ];
         t
     }
@@ -127,11 +127,11 @@ mod tests {
     #[test]
     fn rotated_boxes_use_visible_bounds_and_do_not_snap_to_themselves() {
         let mut t = scene();
-        t.slots[0].rotation = 90.0;
+        t.layers[0].frame.rotation = 90.0;
         let a = align_drag(&t, 0, (378.0, 250.0), 1.0, true);
         assert_eq!(a.x, 380.0); // rotated left edge is x - height = 300
         assert!(a.guides.vertical.contains(&300.0));
-        t.slots.truncate(1);
+        t.layers.truncate(1);
         let a = align_drag(&t, 0, (92.0, 102.0), 1.0, true);
         assert_eq!((a.x, a.y), (92.0, 102.0));
         assert!(a.guides.vertical.is_empty());
