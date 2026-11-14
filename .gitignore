@@ -1,0 +1,9 @@
+/target/
+/photos/
+/captures/
+/local/
+/settings.toml
+/active-layout.sbl
+/sparkbooth-rust-settings.toml
+*.backup-*
+*.tmp
