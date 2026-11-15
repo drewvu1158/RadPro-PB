@@ -137,29 +137,51 @@ pub fn eyebrow(text: impl Into<String>) -> RichText {
         .color(ACCENT)
 }
 
-pub fn brand(ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
-        let painter = ui.painter();
-        painter.circle_stroke(rect.center(), 12.0, Stroke::new(1.0, ACCENT));
-        painter.circle_stroke(rect.center(), 5.0, Stroke::new(1.0, ACCENT));
-        for index in 0..6 {
-            let angle = index as f32 * std::f32::consts::TAU / 6.0;
-            let direction = Vec2::angled(angle);
-            painter.line_segment(
-                [
-                    rect.center() + direction * 5.0,
-                    rect.center() + Vec2::angled(angle + 0.5) * 12.0,
-                ],
-                Stroke::new(1.0, ACCENT),
-            );
-        }
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
-            ui.label(RichText::new("Radiate").font(editorial(23.0)).color(TEXT));
-            ui.label(eyebrow("PHOTO BOOTH").size(8.0));
-        });
-    });
+pub fn camera_mark(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: Color32) {
+    painter.circle_stroke(center, radius, Stroke::new(1.2, color));
+    painter.circle_stroke(center, radius * 0.42, Stroke::new(1.2, color));
+    for index in 0..6 {
+        let angle = index as f32 * std::f32::consts::TAU / 6.0;
+        painter.line_segment(
+            [
+                center + Vec2::angled(angle) * radius * 0.42,
+                center + Vec2::angled(angle + 0.5) * radius,
+            ],
+            Stroke::new(1.0, color),
+        );
+    }
+}
+
+/// A translucent welcome mark painted only over the idle live preview.
+pub fn paint_brand(painter: &egui::Painter, rect: egui::Rect) {
+    if rect.width() < 130.0 || rect.height() < 90.0 {
+        return;
+    }
+    let size = (rect.width() * 0.075)
+        .min(rect.height() * 0.18)
+        .clamp(18.0, 44.0);
+    let center = rect.center();
+    let accent = Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), 130);
+    camera_mark(
+        painter,
+        center - Vec2::new(0.0, size * 1.2),
+        size * 0.36,
+        accent,
+    );
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        "Radiate",
+        editorial(size),
+        Color32::from_rgba_unmultiplied(TEXT.r(), TEXT.g(), TEXT.b(), 135),
+    );
+    painter.text(
+        center + Vec2::new(0.0, size * 0.82),
+        egui::Align2::CENTER_CENTER,
+        "PHOTOBOOTH",
+        button_font((size * 0.24).max(8.0)),
+        accent,
+    );
 }
 
 pub fn primary_button(ui: &mut egui::Ui, text: &str, size: Vec2, enabled: bool) -> egui::Response {
@@ -198,55 +220,67 @@ pub enum HeaderAction {
     None,
     Fullscreen,
     Settings,
+    Library,
     Studio,
     Quit,
 }
 
-/// Operator header for the windowed booth. Guest fullscreen hides it; the
-/// booth page itself carries the take and exit-fullscreen controls.
-pub fn header(ui: &mut egui::Ui, idle: bool, studio: bool) -> HeaderAction {
+/// All host controls live in this popout, including fullscreen escape.
+pub fn operator_menu(
+    ui: &mut egui::Ui,
+    idle: bool,
+    studio: bool,
+    fullscreen: bool,
+) -> HeaderAction {
     let mut action = HeaderAction::None;
-    // Keep operator actions readable at portrait widths; the guest wordmark
-    // lives in the page masthead.
-    let compact = ui.available_width() < 980.0;
-    ui.horizontal(|ui| {
-        ui.style_mut()
-            .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-        ui.spacing_mut().button_padding = Vec2::new(12.0, 9.0);
-        let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
-        ui.painter().circle_filled(r.center(), 3.0, ACCENT);
-        if !compact {
-            ui.label(eyebrow("HOST CONTROLS").color(MUTED));
+    ui.menu_button(RichText::new("Menu").size(13.0), |ui| {
+        ui.set_min_width(180.0);
+        if ui
+            .button(if fullscreen {
+                "Exit fullscreen"
+            } else {
+                "Go fullscreen"
+            })
+            .clicked()
+        {
+            action = HeaderAction::Fullscreen;
+            ui.close();
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Right-to-left: Quit ends up at the far right.
-            if ui.button("Quit").clicked() {
-                action = HeaderAction::Quit;
-            }
-            if ui
-                .add_enabled(
-                    idle,
-                    egui::Button::new(if studio {
-                        "Back to booth"
-                    } else {
-                        "Layout studio"
-                    }),
-                )
-                .clicked()
-            {
-                action = HeaderAction::Studio;
-            }
-            if ui
-                .add_enabled(idle, egui::Button::new("Settings"))
-                .clicked()
-            {
-                action = HeaderAction::Settings;
-            }
-            if ui.button("Go fullscreen").clicked() {
-                action = HeaderAction::Fullscreen;
-            }
-        });
-    });
+        if ui
+            .add_enabled(idle, egui::Button::new("Settings"))
+            .clicked()
+        {
+            action = HeaderAction::Settings;
+            ui.close();
+        }
+        if ui
+            .add_enabled(idle, egui::Button::new("Layout library"))
+            .clicked()
+        {
+            action = HeaderAction::Library;
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                idle,
+                egui::Button::new(if studio {
+                    "Back to booth"
+                } else {
+                    "Layout studio"
+                }),
+            )
+            .clicked()
+        {
+            action = HeaderAction::Studio;
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Quit").clicked() {
+            action = HeaderAction::Quit;
+            ui.close();
+        }
+    })
+    .response
+    .on_hover_text("Booth controls");
     action
 }

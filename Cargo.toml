@@ -22,9 +22,12 @@ directories = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 ab_glyph = "0.2"
 epaint_default_fonts = "0.37"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+serde_json = "1"
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Controls_Dialogs"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Controls_Dialogs", "Win32_System_Memory"] }
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "layouts": [
+    {
+      "id": "summer-party",
+      "name": "Summer Party",
+      "description": "A bright strip for your next celebration.",
+      "template_url": "layouts/summer-party.sbl"
+    }
+  ]
+}

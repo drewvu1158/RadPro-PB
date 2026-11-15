@@ -17,14 +17,19 @@ like a booth at a wedding or party.
   live preview, and photo review. The app uses installed Windows fonts when available
   and falls back to its bundled fonts; no system font is redistributed. The capture
   screen includes a live indicator, a transparent countdown overlay, and paper-style photo cards.
-- **Go fullscreen** enters guest mode with operator settings, studio controls,
-  camera details and file paths hidden. The guest screen is a portrait kiosk:
-  **Take picture** and **Exit fullscreen** at the top, the mirrored live preview
-  in the middle, and the shots from this session along the bottom. F11 also
-  toggles fullscreen, and Escape leaves OS fullscreen while keeping the current
-  photo session.
+- A compact **Take photo** button sits above the live preview. **Menu** opens
+  the fullscreen, settings, layout library, layout studio, and quit controls on demand.
+  **Go fullscreen** enters guest mode; **Exit fullscreen** is in the same menu.
+  F11 also toggles fullscreen, and Escape leaves it while keeping the session.
+- **Cancel set** appears once a session starts, including during the countdown
+  or capture. It clears the current set and returns to the start; late camera
+  results from that set are discarded. Already saved files remain on disk.
+  The Settings panel has its own **Close** button, visible even when scrolled.
+- A translucent Radiate Photobooth logo is centered over the live preview
+  before a session. It disappears when the first countdown starts and stays
+  hidden for the rest of that session, returning for the next guest.
 - Live camera preview (webcam via Media Foundation, through `nokhwa`)
-- **Take picture** starts one countdown (1–10 s, configurable). After each shot,
+- **Take photo** starts one countdown (1–10 s, configurable). After each shot,
   the booth waits for another click; guests choose when to take every picture.
   Failed captures can be retried without discarding completed photos.
 - Tap a captured photo in the filmstrip, then **Retake photo** to replace only
@@ -40,8 +45,10 @@ like a booth at a wedding or party.
 - The bottom filmstrip has one slot per shot in the session — numbered
   placeholders until each capture lands, with the newest shot outlined in the
   accent color. Frames are uploaded to it as they arrive, so guests can judge a
-  shot before taking the next one. The whole camera frame remains visible;
-  saved photos keep the original camera orientation. Longer sessions wrap the
+  shot before taking the next one. The live camera fills the available screen
+  from side to side, using a centered crop and proportional scaling rather than
+  stretching. Saved photos keep the full camera frame and original orientation;
+  selecting a captured photo shows it in full. Longer sessions wrap the
   filmstrip on tall, narrow screens; compact windows keep a single row.
 - Photo review stacks the preview and print controls on portrait screens, with
   selectable thumbnails and a new-session button. Wide screens place controls
@@ -66,6 +73,12 @@ like a booth at a wedding or party.
   Pop Club, Golden Hour, Made of Memories, Electric Night, Birthday Wishes,
   Modern Love, and Less Is More. Every element is editable. Blank strip,
   double-strip and 4×6 grid layouts are also available.
+- **Layout library**: browse built-in designs, downloaded `.sbl` files, or an
+  optional cloud catalog. Selecting a cloud design downloads and validates it,
+  then saves it in your library folder for offline use. Preview it before
+  **Apply to booth**, or choose **Open in Layout studio** to edit it.
+- Change **Photo strip heading** in Settings to replace “THE GOOD TIMES” above
+  the captured photos. Leave it empty to hide the heading.
 - **History and precision**: undo/redo (40 steps), canvas alignment, grid,
   zoom, clean preview, keyboard nudging and snapping. **Save .sbl** preserves
   editable layers; **Apply to booth** saves a separate active copy.
@@ -74,8 +87,11 @@ like a booth at a wedding or party.
   snap within six screen points, regardless of zoom. Hold **Shift** to move
   freely, or turn off **Snap to guides**. Guides disappear on release.
 - **Photo review**: browse the finished layout and each captured photo.
-- **Print layout** opens the Windows printer/paper/copies dialog, and prints
-  the finished layout only after confirmation. The whole layout fits inside
+- Choose **Copies** in the app using the minus/plus buttons or enter a number,
+  then press **Print**. The count starts at one for each new guest and stays
+  selected when retaking or rearranging photos. Windows opens with that count
+  preselected so you can confirm the printer and paper before anything is sent.
+  Each copy contains the complete layout. The whole layout fits inside
   the printable page; this does not configure dye-sub cutters or borderless
   printer settings. A submitted job is not proof of physical completion.
 - **Send me my photos**: visible Email/Text section with disabled input and
@@ -124,7 +140,7 @@ If the preview stays black, the selected device is probably a virtual camera
 whose helper app is not running. Pick the physical webcam instead.
 
 Use the release build for everyday use — debug builds are several times
-slower and much heavier on the CPU. The release binary is a single ~7 MB
+slower and much heavier on the CPU. The release binary is a single
 `radiate-photobooth.exe` with no runtime to install.
 
 ## SBL compatibility
@@ -237,6 +253,60 @@ earlier app name, so saved camera choices, templates and output paths carry over
 Applied layouts live beside it as `active-layout.sbl`. Changed settings and
 overwritten layout files receive timestamped backups. `--settings PATH` can
 select an isolated configuration for testing or a separate booth setup.
+
+## Connecting a layout library
+
+Open **Settings → Layout library** to choose the **Download folder** and enter
+the optional **Cloud catalog URL**, then click **Save library connection**.
+The default download folder is **Layout Library** in the app's local data
+directory; the full path is shown in Settings. No server is required for the
+built-in designs or the **Downloaded** section.
+
+When your AWS server is ready, serve a version 1 JSON catalog and the referenced
+self-contained `.sbl` files through direct HTTPS URLs. The app is an HTTP client;
+it does not provision AWS resources. An example catalog is included at
+[`examples/layout-catalog.json`](examples/layout-catalog.json):
+
+```json
+{
+  "version": 1,
+  "layouts": [
+    {
+      "id": "summer-party",
+      "name": "Summer Party",
+      "description": "A bright strip for your next celebration.",
+      "template_url": "layouts/summer-party.sbl"
+    }
+  ]
+}
+```
+
+Create a design in **Layout studio → Save .sbl**, upload that file, and add its
+entry to the catalog. `template_url` can be an absolute HTTPS URL or a relative
+URL resolved against the catalog URL. URLs with query parameters are supported.
+The server must accept a normal GET without custom authentication headers;
+expired signed URLs require a refreshed catalog. Redirects are not followed.
+HTTP is supported only on localhost/loopback for development.
+
+Each `id` must be unique regardless of letter case, with 1–80 ASCII letters,
+numbers, hyphens or underscores (Windows filenames are case insensitive).
+`name` is required; `description` is optional. The catalog is limited to 1 MiB
+and 200 entries to bound memory and browsing work. Layout downloads use the same
+32 MiB budget and SBL validation as local imports.
+
+Open **Menu → Layout library → Cloud** to fetch the catalog; **Refresh cloud
+library** retrieves changes. Selecting an entry saves `layout-<id>.sbl` into
+your chosen folder before showing its preview. An unchanged download reuses the
+file; a changed file receives a timestamped backup before replacement. An
+invalid or failed download leaves an existing copy intact. Network and decoding
+work run off the UI thread, with a 15-second network timeout.
+
+The **Downloaded** section scans that folder and opens the saved `.sbl` files
+without contacting the server, including after restarting the app. You can also
+copy your own compatible `.sbl` files into the folder and click **Refresh folder**.
+Downloading a design does not apply it; **Apply to booth** saves a separate active
+copy. Photos are never uploaded by the layout library. The client has been tested
+against a local HTTP fixture; a deployed AWS endpoint has not been tested yet.
 
 ## Out of scope (for now)
 

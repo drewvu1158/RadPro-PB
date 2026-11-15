@@ -25,6 +25,12 @@ pub struct Settings {
     pub simulate: bool,
     /// A self-contained copy of the applied SBL layout, if selected.
     pub template_path: Option<PathBuf>,
+    /// Heading above the captured photos. Empty hides the heading.
+    pub filmstrip_heading: String,
+    /// Optional HTTPS JSON catalog, configured when a server is available.
+    pub layout_catalog_url: String,
+    /// Persistent, offline copies of downloaded layouts.
+    pub layout_library_dir: PathBuf,
 }
 
 impl Default for Settings {
@@ -39,6 +45,9 @@ impl Default for Settings {
             save_individual_shots: true,
             simulate: false,
             template_path: None,
+            filmstrip_heading: "THE GOOD TIMES".into(),
+            layout_catalog_url: String::new(),
+            layout_library_dir: default_library_dir(),
         }
     }
 }
@@ -127,6 +136,12 @@ pub fn default_capture_dir() -> PathBuf {
         .join("Sparkbooth-rust")
 }
 
+pub fn default_library_dir() -> PathBuf {
+    directories::ProjectDirs::from("com", "sparkbooth", "sparkbooth-rust")
+        .map(|dirs| dirs.data_local_dir().join("Layout Library"))
+        .unwrap_or_else(|| PathBuf::from("Layout Library"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,11 +156,15 @@ mod tests {
         let mut settings = Settings::default();
         settings.shots = 3;
         settings.light_border = false;
+        settings.filmstrip_heading = "Our wedding memories".into();
+        settings.layout_catalog_url = "https://example.com/catalog.json".into();
+        settings.layout_library_dir = dir.join("My layouts");
         settings.save(&path).unwrap();
         let loaded = Settings::load(&path).unwrap();
         assert_eq!(loaded.shots, 3);
         assert!(!loaded.light_border);
         assert_eq!(loaded.layout, LayoutKind::Strip);
+        assert_eq!(loaded, settings);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -167,6 +186,9 @@ mod tests {
         assert_eq!(settings.camera_index, 1);
         assert_eq!(settings.shots, 4);
         assert_eq!(settings.output_dir, default_capture_dir());
+        assert_eq!(settings.filmstrip_heading, "THE GOOD TIMES");
+        assert!(settings.layout_catalog_url.is_empty());
+        assert_eq!(settings.layout_library_dir, default_library_dir());
         settings.validate().unwrap();
     }
 

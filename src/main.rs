@@ -16,6 +16,8 @@ mod design;
 mod editor;
 mod file_dialog;
 mod layout;
+mod library;
+mod library_ui;
 mod presets;
 mod printing;
 mod settings;

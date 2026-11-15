@@ -3,6 +3,7 @@
 use crate::booth::{Booth, BoothEvent, Phase};
 use crate::camera::{CameraClient, CaptureResult};
 use crate::layout::{self, LayoutKind, LayoutOptions};
+use crate::library_ui::{LibraryAction, LibraryView};
 use crate::settings::{default_settings_path, Settings};
 use crate::storage;
 use crate::ui_theme::{self as theme, HeaderAction};
@@ -44,10 +45,36 @@ struct DraggedPhoto {
     index: usize,
 }
 
+/// Live video covers the viewport with a centered crop; captured photos fit in full.
+/// Cropping UVs rather than changing the image proportions keeps faces undistorted.
+fn preview_placement(area: egui::Rect, source: Vec2, live: bool) -> (egui::Rect, egui::Rect) {
+    if live {
+        let scale = (area.width() / source.x).max(area.height() / source.y);
+        let visible = (area.size() / (source * scale)).min(Vec2::splat(1.0));
+        let crop = (Vec2::splat(1.0) - visible) * 0.5;
+        (
+            area,
+            egui::Rect::from_min_max(
+                egui::pos2(1.0 - crop.x, crop.y),
+                egui::pos2(crop.x, 1.0 - crop.y),
+            ),
+        )
+    } else {
+        let size = source * (area.width() / source.x).min(area.height() / source.y);
+        (
+            egui::Rect::from_center_size(area.center(), size),
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        )
+    }
+}
+
 pub struct SparkboothApp {
     settings: Settings,
     settings_path: PathBuf,
     show_settings: bool,
+    show_library: bool,
+    library: LibraryView,
+    library_folder_input: String,
     camera: CameraClient,
     booth: Booth,
     shots: Vec<DynamicImage>,
@@ -72,6 +99,7 @@ pub struct SparkboothApp {
     selected_capture: Option<usize>,
     last_capture: Option<usize>,
     print_feedback: Option<String>,
+    print_copies: u16,
 }
 
 impl SparkboothApp {
@@ -116,9 +144,12 @@ impl SparkboothApp {
         let editor = Editor::new(template.clone().unwrap_or_else(|| Template::builtin(false)));
         theme::install(ctx);
         Self {
+            library_folder_input: settings.layout_library_dir.to_string_lossy().into_owned(),
             settings,
             settings_path,
             show_settings: false,
+            show_library: false,
+            library: LibraryView::default(),
             camera,
             booth,
             shots: Vec::new(),
@@ -143,6 +174,7 @@ impl SparkboothApp {
             selected_capture: None,
             last_capture: None,
             print_feedback: None,
+            print_copies: 1,
         }
     }
 
@@ -150,6 +182,7 @@ impl SparkboothApp {
         if enabled {
             self.show_settings = false;
             self.show_editor = false;
+            self.show_library = false;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(enabled));
     }
@@ -396,6 +429,7 @@ impl SparkboothApp {
         self.selected_capture = None;
         self.last_capture = None;
         self.print_feedback = None;
+        self.print_copies = 1;
         self.last_strip = None;
         self.session_template = None;
         self.status = "Ready for the next session.".into();
@@ -419,103 +453,123 @@ impl SparkboothApp {
         }
     }
 
-    fn guest_masthead(&mut self, ui: &mut egui::Ui, fullscreen: bool) {
-        ui.horizontal(|ui| {
-            theme::brand(ui);
-            if fullscreen {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Exit fullscreen").size(13.0))
-                                .min_size(Vec2::new(132.0, 38.0))
-                                .corner_radius(20),
-                        )
-                        .clicked()
-                    {
-                        self.set_fullscreen(ui.ctx(), false);
-                    }
-                });
+    /// Keep the guest action centered independently of the small host popout.
+    fn top_controls(&mut self, ui: &mut egui::Ui, fullscreen: bool) -> HeaderAction {
+        let width = ui.available_width();
+        let (row, _) = ui.allocate_exact_size(Vec2::new(width, 46.0), egui::Sense::hover());
+        let menu_rect = egui::Rect::from_min_size(
+            egui::pos2(row.right() - 64.0, row.top()),
+            Vec2::new(64.0, 46.0),
+        );
+        let mut menu_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("host-popout")
+                .max_rect(menu_rect)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+        let action = theme::operator_menu(
+            &mut menu_ui,
+            self.booth.phase() == Phase::Preview,
+            self.show_editor,
+            fullscreen,
+        );
+        if self.booth.phase() != Phase::Preview && !self.show_editor && !self.show_library {
+            let mut cancel_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("cancel-set")
+                    .max_rect(egui::Rect::from_min_size(row.min, Vec2::new(130.0, 46.0)))
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            if cancel_ui
+                .add(egui::Button::new("Cancel set").min_size(Vec2::new(120.0, 46.0)))
+                .on_hover_text("Start over with a new set of photos")
+                .clicked()
+            {
+                self.reset_session();
             }
-        });
+        }
+        if self.booth.phase() != Phase::Review && !self.show_editor && !self.show_library {
+            let label = match self.booth.phase() {
+                Phase::Countdown => "Get ready...".to_owned(),
+                Phase::Shooting => "Taking photo...".to_owned(),
+                _ => self
+                    .selected_capture
+                    .map(|index| format!("Retake photo {}", index + 1))
+                    .unwrap_or_else(|| "Take photo".to_owned()),
+            };
+            let ready = self.booth.ready_for_picture()
+                && self.preview_texture.is_some()
+                && self.template_error.is_none();
+            let size = Vec2::new((width - 144.0).clamp(120.0, 210.0), 46.0);
+            let take_rect = egui::Rect::from_center_size(row.center(), size);
+            let mut take_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("take-photo")
+                    .max_rect(take_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Center)),
+            );
+            let response = theme::primary_button(&mut take_ui, &label, size, ready);
+            theme::camera_mark(
+                take_ui.painter(),
+                egui::pos2(response.rect.left() + 21.0, response.rect.center().y),
+                8.0,
+                if ready {
+                    theme::ON_ACCENT
+                } else {
+                    theme::ON_ACCENT.gamma_multiply(0.5)
+                },
+            );
+            if response.clicked() {
+                self.request_picture();
+            }
+        }
+        action
     }
 
-    /// Portrait kiosk: the capture action stays above the full camera frame,
+    /// Portrait kiosk: the capture action stays above the full-width live preview,
     /// with session photos below it. Compact windows use the same hierarchy.
-    fn booth_page(&mut self, ui: &mut egui::Ui, fullscreen: bool) {
+    fn booth_page(&mut self, ui: &mut egui::Ui) {
         let available_height = ui.available_height();
         let compact = available_height < 720.0;
-        egui::Panel::top("booth_take")
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 4)))
-            .show(ui, |ui| {
-                self.guest_masthead(ui, fullscreen);
-                ui.add_space(if compact { 10.0 } else { 24.0 });
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new("Make a little memory.")
-                            .font(theme::editorial(if compact { 32.0 } else { 44.0 }))
-                            .color(theme::TEXT),
-                    );
-                    if !compact {
-                        ui.add_space(3.0);
-                        ui.label(
-                            RichText::new("Strike a pose. Take a photo. Make it yours.")
-                                .size(15.0)
-                                .color(theme::MUTED),
-                        );
-                    }
-                    ui.add_space(if compact { 10.0 } else { 18.0 });
-                    let ready = self.booth.ready_for_picture()
-                        && self.preview_texture.is_some()
-                        && self.template_error.is_none();
-                    let label = match self.booth.phase() {
-                        Phase::Countdown => "Get ready...".to_owned(),
-                        Phase::Shooting => "Taking picture...".to_owned(),
-                        _ => self
-                            .selected_capture
-                            .map(|index| format!("Retake photo {}", index + 1))
-                            .unwrap_or_else(|| "Take picture".to_owned()),
-                    };
-                    let size = Vec2::new(
-                        ui.available_width().min(330.0),
-                        if compact { 54.0 } else { 64.0 },
-                    );
-                    if theme::primary_button(ui, &label, size, ready).clicked() {
-                        self.request_picture();
-                    }
-                    ui.add_space(4.0);
-                    if self.booth.retaking_index().is_some() {
-                        if ui
-                            .add_enabled(
-                                self.booth.phase() == Phase::Countdown,
-                                egui::Button::new("Keep original photo").corner_radius(20),
-                            )
-                            .clicked()
+        if self.booth.retaking_index().is_some()
+            || self.selected_capture.is_some()
+            || self.capture_error.is_some()
+            || self.template_error.is_some()
+        {
+            egui::Panel::top("booth_context")
+                .show_separator_line(false)
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 4)))
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        if self.booth.retaking_index().is_some() {
+                            if ui
+                                .add_enabled(
+                                    self.booth.phase() == Phase::Countdown,
+                                    egui::Button::new("Keep original photo").corner_radius(20),
+                                )
+                                .clicked()
+                            {
+                                self.booth.cancel_retake();
+                                self.capture_error = None;
+                            }
+                        } else if self.selected_capture.is_some()
+                            && self.booth.ready_for_picture()
+                            && ui.button("Back to live camera").clicked()
                         {
-                            self.booth.cancel_retake();
-                            self.capture_error = None;
-                        }
-                    } else if self.selected_capture.is_some() && self.booth.ready_for_picture() {
-                        if ui.button("Back to live camera").clicked() {
                             self.selected_capture = None;
                         }
-                    }
-                    let hint = match self.booth.phase() {
-                        Phase::Countdown => "Look at the camera and hold that pose.",
-                        Phase::Shooting => "One moment. Capturing your photo.",
-                        Phase::Ready => "Tap a photo below to review or retake it.",
-                        _ => "A short countdown, then your moment in the spotlight.",
-                    };
-                    ui.label(RichText::new(hint).size(12.0).color(theme::MUTED));
+                        if let Some(error) =
+                            self.capture_error.as_ref().or(self.template_error.as_ref())
+                        {
+                            ui.label(RichText::new(error).size(13.0).color(theme::ACCENT));
+                        }
+                    });
                 });
-                if let Some(error) = self.capture_error.as_ref().or(self.template_error.as_ref()) {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(error).size(13.0).color(theme::ACCENT));
-                }
-            });
+        }
 
         let slots = self.booth.shots_wanted().max(1) as usize;
         egui::Panel::bottom("booth_filmstrip")
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 10)))
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 10)))
             .show(ui, |ui| {
                 let width = ui.available_width();
                 let columns = slots.min(if width < 1000.0 && !compact { 4 } else { 8 });
@@ -530,7 +584,6 @@ impl SparkboothApp {
                 let image_h = (cell_w - 12.0).max(1.0) * 0.75;
                 let cell_h = image_h + if cell_w < 100.0 { 30.0 } else { 40.0 };
                 ui.horizontal(|ui| {
-                    ui.label(theme::eyebrow("THE GOOD TIMES"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!(
@@ -541,6 +594,13 @@ impl SparkboothApp {
                             .size(12.0)
                             .color(theme::MUTED),
                         );
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(theme::eyebrow(&self.settings.filmstrip_heading))
+                                    .truncate(),
+                            )
+                            .on_hover_text(&self.settings.filmstrip_heading);
+                        });
                     });
                 });
                 ui.add_space(3.0);
@@ -583,14 +643,14 @@ impl SparkboothApp {
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(4, 16)))
+            .frame(egui::Frame::new())
             .show(ui, |ui| {
                 let (area, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
                 self.paint_preview(ui, area);
             });
     }
 
-    /// Fit the full, mirrored frame inside the card; the saved shot is unchanged.
+    /// Fill the live viewport without stretching; selected captured shots remain fully visible.
     fn paint_preview(&self, ui: &egui::Ui, area: egui::Rect) {
         if area.width() < 20.0 || area.height() < 20.0 {
             return;
@@ -621,23 +681,28 @@ impl SparkboothApp {
             return;
         };
         let ts = texture.size_vec2();
-        let available = (area.size() - Vec2::new(12.0, 34.0)).max(Vec2::splat(1.0));
-        let size = ts * (available.x / ts.x).min(available.y / ts.y);
-        let image_rect = egui::Rect::from_center_size(area.center() - Vec2::new(0.0, 10.0), size);
+        let bounds = if selected.is_some() {
+            egui::Rect::from_min_size(
+                area.min + Vec2::splat(6.0),
+                (area.size() - Vec2::new(12.0, 36.0)).max(Vec2::splat(1.0)),
+            )
+        } else {
+            area
+        };
+        let (image_rect, uv) = preview_placement(bounds, ts, selected.is_none());
         let card = image_rect.expand(5.0);
-        painter.rect_filled(card, 18.0, theme::SURFACE);
-        painter.rect_stroke(
-            card,
-            18.0,
-            egui::Stroke::new(1.0, theme::BORDER),
-            egui::StrokeKind::Inside,
-        );
-        egui::Image::from_texture(SizedTexture::new(texture.id(), size))
-            .uv(egui::Rect::from_min_max(
-                egui::pos2(if selected.is_some() { 0.0 } else { 1.0 }, 0.0),
-                egui::pos2(if selected.is_some() { 1.0 } else { 0.0 }, 1.0),
-            ))
-            .corner_radius(14)
+        if selected.is_some() {
+            painter.rect_filled(card, 18.0, theme::SURFACE);
+            painter.rect_stroke(
+                card,
+                18.0,
+                egui::Stroke::new(1.0, theme::BORDER),
+                egui::StrokeKind::Inside,
+            );
+        }
+        egui::Image::from_texture(SizedTexture::new(texture.id(), image_rect.size()))
+            .uv(uv)
+            .corner_radius(if selected.is_some() { 14 } else { 0 })
             .paint_at(ui, image_rect);
 
         if selected.is_none() && image_rect.width() > 260.0 && image_rect.height() > 160.0 {
@@ -655,15 +720,18 @@ impl SparkboothApp {
                 theme::TEXT,
             );
         }
-        painter.text(
-            egui::pos2(image_rect.center().x, card.bottom() + 16.0),
-            egui::Align2::CENTER_CENTER,
-            selected
-                .map(|index| format!("PHOTO {}  /  SELECT RETAKE TO TRY AGAIN", index + 1))
-                .unwrap_or_else(|| "LIVE PREVIEW  /  MIRRORED".to_owned()),
-            egui::FontId::proportional(10.0),
-            theme::MUTED,
-        );
+        if let Some(index) = selected {
+            painter.text(
+                egui::pos2(image_rect.center().x, card.bottom() + 16.0),
+                egui::Align2::CENTER_CENTER,
+                format!("PHOTO {}  /  SELECT RETAKE TO TRY AGAIN", index + 1),
+                egui::FontId::proportional(10.0),
+                theme::MUTED,
+            );
+        }
+        if self.booth.phase() == Phase::Preview && selected.is_none() {
+            theme::paint_brand(&painter, image_rect);
+        }
         if self.booth.phase() == Phase::Countdown {
             let radius = (image_rect.height() * 0.18).clamp(35.0, 90.0);
             let center = image_rect.center();
@@ -830,18 +898,21 @@ impl SparkboothApp {
                 self.template_error = None;
                 if self.save_settings() {
                     self.show_editor = false;
+                    self.show_library = false;
                     self.status = "Layout applied. Ready for your next session.".into();
                 } else {
                     self.editor.message = self.status.clone();
+                    self.library.message = self.status.clone();
                 }
             }
-            Err(e) => self.editor.message = format!("Could not apply layout: {e}"),
+            Err(e) => {
+                self.editor.message = format!("Could not apply layout: {e}");
+                self.library.message = self.editor.message.clone();
+            }
         }
     }
 
     fn review_page(&mut self, ui: &mut egui::Ui, fullscreen: bool) {
-        self.guest_masthead(ui, fullscreen);
-        ui.add_space(20.0);
         // The scroll content has unbounded height; size the preview from the viewport.
         let viewport_height = ui.available_height();
         egui::ScrollArea::vertical()
@@ -1177,48 +1248,74 @@ impl SparkboothApp {
 
     fn review_actions(&mut self, ui: &mut egui::Ui, width: f32, fullscreen: bool) {
         let inner_width = (width - 40.0).max(100.0);
-        theme::card().show(ui, |ui| {
-            ui.set_width(inner_width);
-            ui.label(theme::eyebrow("A LITTLE SOMETHING TO KEEP"));
-            ui.add_space(4.0);
-            ui.label(RichText::new("Take the memories home.").font(theme::editorial(25.0)));
-            ui.label(
-                RichText::new("Print your complete photo layout.")
-                    .size(14.0)
-                    .color(theme::MUTED),
-            );
-            ui.add_space(14.0);
-            if theme::primary_button(
-                ui,
-                "Print photos",
-                Vec2::new(inner_width, 54.0),
-                self.print_image.is_some() && self.booth.phase() == Phase::Review,
-            )
-            .clicked()
+        ui.set_width(width);
+        let previous_copies = self.print_copies;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Copies").size(16.0));
+            if ui
+                .add_enabled(
+                    self.print_copies > 1,
+                    egui::Button::new("-").min_size(Vec2::splat(42.0)),
+                )
+                .on_hover_text("Fewer copies")
+                .clicked()
             {
-                if let Some(image) = &self.print_image {
-                    self.print_feedback = Some(match printing::print_image(image, None) {
-                        Ok(PrintOutcome::Submitted { job_id }) => {
-                            format!("Print job {job_id} sent to the printer")
-                        }
-                        Ok(PrintOutcome::Cancelled) => {
-                            "Printing cancelled. Your photos are still here.".into()
-                        }
-                        Err(error) => format!("Printing failed: {error}"),
-                    });
-                }
+                self.print_copies -= 1;
             }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Choose your printer, paper size, and copies in the print dialog.")
-                    .size(12.0)
-                    .color(theme::MUTED),
+            ui.add_sized(
+                [64.0, 42.0],
+                egui::DragValue::new(&mut self.print_copies)
+                    .range(1..=printing::MAX_COPIES)
+                    .speed(1),
             );
-            if let Some(feedback) = &self.print_feedback {
-                ui.add_space(8.0);
-                ui.label(feedback);
+            if ui
+                .add_enabled(
+                    self.print_copies < printing::MAX_COPIES,
+                    egui::Button::new("+").min_size(Vec2::splat(42.0)),
+                )
+                .on_hover_text("More copies")
+                .clicked()
+            {
+                self.print_copies += 1;
             }
         });
+        if previous_copies != self.print_copies {
+            self.print_feedback = None;
+        }
+        ui.add_space(12.0);
+        let label = if self.print_copies == 1 {
+            "Print 1 copy".to_owned()
+        } else {
+            format!("Print {} copies", self.print_copies)
+        };
+        if theme::primary_button(
+            ui,
+            &label,
+            Vec2::new(width.min(380.0), 54.0),
+            self.print_image.is_some() && self.booth.phase() == Phase::Review,
+        )
+        .on_hover_text("Confirm your printer and paper in Windows")
+        .clicked()
+        {
+            if let Some(image) = &self.print_image {
+                self.print_feedback = match printing::print_image(image, self.print_copies, None) {
+                    Ok(PrintOutcome::Submitted { copies, .. }) => {
+                        self.print_copies = copies;
+                        Some(format!(
+                            "{} {} sent to the printer.",
+                            copies,
+                            if copies == 1 { "copy" } else { "copies" }
+                        ))
+                    }
+                    Ok(PrintOutcome::Cancelled) => None,
+                    Err(error) => Some(format!("Printing failed: {error}")),
+                };
+            }
+        }
+        if let Some(feedback) = &self.print_feedback {
+            ui.add_space(8.0);
+            ui.label(feedback);
+        }
         ui.add_space(12.0);
         theme::card().show(ui, |ui| {
             ui.set_width(inner_width);
@@ -1250,6 +1347,8 @@ impl SparkboothApp {
 impl eframe::App for SparkboothApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        self.library.poll(&ctx);
 
         // Advance the booth clock; capture on demand.
         let dt_ms = (ctx.input(|i| i.stable_dt) * 1000.0) as u64;
@@ -1292,56 +1391,48 @@ impl eframe::App for SparkboothApp {
         }
 
         let mut action = HeaderAction::None;
-        // Guest fullscreen has no operator chrome; the booth page carries its
-        // own take and exit-fullscreen controls. Windowed mode keeps the header
-        // in every phase so the take button never moves under the guest's
-        // finger; the operator actions are disabled outside Preview.
-        if !fullscreen {
-            egui::Panel::top("booth_header")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::BACKGROUND)
-                        .inner_margin(egui::Margin::symmetric(20, 14)),
-                )
-                .show(ui, |ui| {
-                    action =
-                        theme::header(ui, self.booth.phase() == Phase::Preview, self.show_editor);
-                });
-        }
+        egui::Panel::top("booth_controls")
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BACKGROUND)
+                    .inner_margin(egui::Margin::symmetric(20, 8)),
+            )
+            .show(ui, |ui| {
+                action = self.top_controls(ui, fullscreen);
+            });
         match action {
-            HeaderAction::Fullscreen => self.set_fullscreen(&ctx, true),
+            HeaderAction::Fullscreen => self.set_fullscreen(&ctx, !fullscreen),
             HeaderAction::Settings => {
+                if fullscreen {
+                    self.set_fullscreen(&ctx, false);
+                }
                 self.show_settings = !self.show_settings;
                 self.show_editor = false;
+                self.show_library = false;
+            }
+            HeaderAction::Library => {
+                if fullscreen {
+                    self.set_fullscreen(&ctx, false);
+                }
+                self.show_library = true;
+                self.show_editor = false;
+                self.show_settings = false;
+                self.library.open(
+                    &self.settings.layout_library_dir,
+                    &self.settings.layout_catalog_url,
+                );
             }
             HeaderAction::Studio => {
+                if fullscreen {
+                    self.set_fullscreen(&ctx, false);
+                }
                 self.show_editor = !self.show_editor;
                 self.show_settings = false;
+                self.show_library = false;
             }
             HeaderAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             HeaderAction::None => {}
-        }
-        if !fullscreen {
-            egui::Panel::bottom("operator_status")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::BACKGROUND)
-                        .inner_margin(egui::Margin::symmetric(20, 6)),
-                )
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if let Some(name) = &self.camera_active {
-                            ui.label(RichText::new(name).size(11.0).color(theme::MUTED));
-                            ui.separator();
-                        }
-                        let text = self.camera_note.as_deref().unwrap_or(&self.status);
-                        ui.add(
-                            egui::Label::new(RichText::new(text).size(11.0).color(theme::MUTED))
-                                .truncate(),
-                        )
-                        .on_hover_text(text);
-                    });
-                });
         }
 
         if !fullscreen
@@ -1352,10 +1443,37 @@ impl eframe::App for SparkboothApp {
             egui::Panel::right("settings_panel")
                 .default_size(320.0)
                 .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Booth settings");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Close").on_hover_text("Close settings").clicked() {
+                                self.show_settings = false;
+                            }
+                        });
+                    });
                     egui::ScrollArea::vertical()
                         .id_salt("operator_settings_scroll")
                         .show(ui, |ui| {
-                            ui.heading("Booth settings");
+                            // Operator diagnostics stay available here without a permanent footer.
+                            if let Some(name) = &self.camera_active {
+                                ui.small(format!("Connected: {name}"));
+                            }
+                            if let Some(note) = &self.camera_note {
+                                ui.small(note);
+                            }
+                            if !self.status.is_empty() {
+                                ui.small(&self.status);
+                            }
+                            ui.add_space(8.0);
+                            ui.label("Photo strip heading");
+                            if ui
+                                .text_edit_singleline(&mut self.settings.filmstrip_heading)
+                                .lost_focus()
+                            {
+                                self.save_settings();
+                            }
+                            ui.small("Shown above the captured photos. Leave blank to hide it.");
+                            ui.add_space(8.0);
                             if let Some(t) = &self.template {
                                 ui.label(format!("{} · {} captures", t.name, t.shots_needed()));
                                 ui.small("Capture count follows the applied template.");
@@ -1494,9 +1612,74 @@ impl eframe::App for SparkboothApp {
                                 self.settings.output_dir = PathBuf::from(dir);
                                 self.save_settings();
                             }
+                            ui.separator();
+                            ui.heading("Layout library");
+                            ui.add_enabled_ui(!self.library.busy(), |ui| {
+                                ui.label("Cloud catalog URL");
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.settings.layout_catalog_url,
+                                        )
+                                        .hint_text("https://…/catalog.json")
+                                        .desired_width(f32::INFINITY),
+                                    )
+                                    .lost_focus()
+                                {
+                                    self.save_settings();
+                                }
+                                ui.small("Optional. Add it when your server is ready.");
+                                ui.label("Download folder");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.library_folder_input)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if ui.button("Save library connection").clicked() {
+                                    if self.library_folder_input.trim().is_empty() {
+                                        self.status =
+                                            "Choose a folder for downloaded layouts.".into();
+                                    } else {
+                                        self.settings.layout_library_dir =
+                                            PathBuf::from(&self.library_folder_input);
+                                        self.save_settings();
+                                    }
+                                }
+                            });
+                            ui.small(
+                                "Cloud selections download here as .sbl files for offline use.",
+                            );
+                            if ui.button("Open layout library").clicked() {
+                                self.library.open(
+                                    &self.settings.layout_library_dir,
+                                    &self.settings.layout_catalog_url,
+                                );
+                                self.show_library = true;
+                                self.show_settings = false;
+                            }
+                            ui.separator();
                             ui.monospace(self.settings_path.display().to_string());
                         });
                 });
+        }
+
+        if !fullscreen && self.show_library {
+            let mut selected = None;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::BACKGROUND).inner_margin(20))
+                .show(ui, |ui| {
+                    selected = self.library.ui(ui);
+                });
+            match selected {
+                Some(LibraryAction::Apply(template)) => self.apply_template(template),
+                Some(LibraryAction::Studio(template)) => {
+                    self.editor = Editor::new(template);
+                    self.show_editor = true;
+                    self.show_library = false;
+                }
+                Some(LibraryAction::Back) => self.show_library = false,
+                None => {}
+            }
+            return;
         }
 
         if !fullscreen && self.show_editor {
@@ -1511,14 +1694,20 @@ impl eframe::App for SparkboothApp {
         }
 
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BACKGROUND)
-                    .inner_margin(if fullscreen { 24 } else { 20 }),
-            )
+            .frame(egui::Frame::new().fill(theme::BACKGROUND).inner_margin(
+                if self.booth.phase() == Phase::Review {
+                    if fullscreen {
+                        24
+                    } else {
+                        20
+                    }
+                } else {
+                    0
+                },
+            ))
             .show(ui, |ui| match self.booth.phase() {
                 Phase::Review => self.review_page(ui, fullscreen),
-                _ => self.booth_page(ui, fullscreen),
+                _ => self.booth_page(ui),
             });
     }
 }
@@ -1556,6 +1745,129 @@ mod session_edit_tests {
             .iter()
             .map(|photo| photo.get_pixel(0, 0).0)
             .collect()
+    }
+
+    #[test]
+    fn preview_fills_wide_and_portrait_viewports_without_stretching() {
+        for viewport in [
+            Vec2::new(1280.0, 500.0),
+            Vec2::new(760.0, 1000.0),
+            Vec2::new(640.0, 480.0),
+        ] {
+            for source in [Vec2::new(640.0, 480.0), Vec2::new(1920.0, 1080.0)] {
+                let area = egui::Rect::from_min_size(egui::pos2(10.0, 70.0), viewport);
+                let (image, uv) = preview_placement(area, source, true);
+                assert_eq!(
+                    image, area,
+                    "live video must fill both edges of its viewport"
+                );
+                assert!(uv.min.x > uv.max.x, "live video remains mirrored");
+                for point in [uv.min, uv.max] {
+                    assert!((0.0..=1.0).contains(&point.x));
+                    assert!((0.0..=1.0).contains(&point.y));
+                }
+                assert!((uv.center().x - 0.5).abs() < 0.00001);
+                assert!((uv.center().y - 0.5).abs() < 0.00001);
+                let horizontal_scale = source.x * uv.width().abs() / image.width();
+                let vertical_scale = source.y * uv.height() / image.height();
+                assert!(
+                    (horizontal_scale - vertical_scale).abs() < 0.00001,
+                    "faces must keep their proportions"
+                );
+                let (photo, uv) = preview_placement(area, source, false);
+                assert_eq!(uv.min, egui::Pos2::ZERO);
+                assert_eq!(
+                    uv.max,
+                    egui::pos2(1.0, 1.0),
+                    "captured photos remain fully visible"
+                );
+                assert!(area.contains_rect(photo));
+                assert!((photo.width() / photo.height() - source.x / source.y).abs() < 0.00001);
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_a_set_resets_every_stage_and_detaches_a_pending_capture() {
+        for stage in [
+            "first-countdown",
+            "ready",
+            "countdown",
+            "shooting",
+            "retake",
+            "review",
+        ] {
+            let (ctx, mut app, dir) = app(&format!("cancel-{stage}"));
+            let old = [220, 20, 20, 255];
+            if stage != "first-countdown" {
+                capture(&mut app, &ctx, old);
+            }
+            match stage {
+                "first-countdown" | "countdown" | "shooting" => app.request_picture(),
+                "retake" => app.request_retake(0),
+                "review" => {
+                    capture(&mut app, &ctx, old);
+                    capture(&mut app, &ctx, old);
+                }
+                _ => {}
+            }
+            let pending = if stage == "shooting" {
+                app.booth.update(1000);
+                let (sender, receiver) = mpsc::channel();
+                app.capture_rx = Some(receiver);
+                Some(sender)
+            } else {
+                None
+            };
+            let saved = app
+                .last_strip
+                .as_ref()
+                .map(|path| (path.clone(), std::fs::read(path).unwrap()));
+            app.capture_error = Some("An earlier capture failed".into());
+            app.print_copies = 3;
+            app.reset_session();
+            assert_eq!(app.booth.phase(), Phase::Preview, "{stage}");
+            assert_eq!(app.booth.shots_taken(), 0);
+            assert_eq!(app.booth.retaking_index(), None);
+            assert!(app.shots.is_empty());
+            assert!(app.shot_textures.is_empty());
+            assert!(app.capture_rx.is_none());
+            assert!(app.capture_error.is_none());
+            assert!(app.review_texture.is_none());
+            assert!(app.print_image.is_none());
+            assert!(app.last_strip.is_none());
+            assert!(app.session_template.is_none());
+            assert_eq!(app.selected_capture, None);
+            assert_eq!(app.last_capture, None);
+            assert_eq!(app.print_copies, 1);
+            if let Some(sender) = pending {
+                assert!(
+                    sender
+                        .send(Ok(RgbaImage::from_pixel(16, 12, Rgba(old))))
+                        .is_err(),
+                    "a late frame from the cancelled set must be disconnected"
+                );
+            }
+            if let Some((path, bytes)) = saved {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    bytes,
+                    "cancelling must preserve already saved files"
+                );
+            }
+            let new = [20, 220, 20, 255];
+            capture(&mut app, &ctx, new);
+            app.drain_capture(&ctx);
+            assert_eq!(
+                shot_colors(&app),
+                vec![new],
+                "{stage} must start with an empty set"
+            );
+            drop(app);
+            if dir.exists() {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
     }
 
     fn assert_print_order(app: &SparkboothApp, expected: &[[u8; 4]]) {
@@ -1615,7 +1927,9 @@ mod session_edit_tests {
         capture(&mut app, &ctx, red);
         assert_eq!(app.booth.phase(), Phase::Review);
         assert_print_order(&app, &[blue, green, red]);
+        app.print_copies = 3;
         app.reset_session();
+        assert_eq!(app.print_copies, 1);
         assert!(app.shots.is_empty());
         assert!(app.shot_textures.is_empty());
         assert_eq!(app.selected_capture, None);
@@ -1634,7 +1948,9 @@ mod session_edit_tests {
         let original_path = app.last_strip.clone().unwrap();
         let original_bytes = std::fs::read(&original_path).unwrap();
         let textures: Vec<_> = app.shot_textures.iter().map(TextureHandle::id).collect();
+        app.print_copies = 3;
         assert!(app.reorder_photos(&ctx, PhotoReorder::Move, 0, 2));
+        assert_eq!(app.print_copies, 3);
         assert_eq!(shot_colors(&app), vec![colors[1], colors[2], colors[0]]);
         assert_eq!(
             app.shot_textures
