@@ -365,6 +365,18 @@ impl Template {
     pub fn photo_count(&self) -> usize {
         self.layers.iter().filter(|l| l.is_photo()).count()
     }
+    /// Visible photo regions in the same back-to-front order used by rendering.
+    /// Repeated shot indices intentionally refer to the same captured photo.
+    pub fn photo_regions(&self) -> impl DoubleEndedIterator<Item = (usize, Frame)> + '_ {
+        self.layers
+            .iter()
+            .filter(|layer| layer.visible)
+            .filter_map(|layer| match layer.kind {
+                LayerKind::Photo { shot, .. } => Some((shot as usize, layer.frame)),
+                _ => None,
+            })
+    }
+
     pub fn shots_needed(&self) -> u32 {
         self.layers
             .iter()

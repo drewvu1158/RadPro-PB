@@ -13,21 +13,39 @@ like a booth at a wedding or party.
 
 ## What it does
 
-- A minimal dark interface with warm neutral colors, serif headings, live
-  preview, and photo review. The app uses the host's Georgia font when available
-  and falls back to its bundled fonts; no system font is redistributed.
+- A black interface with warm peach accents, Georgia headings, Segoe UI controls,
+  live preview, and photo review. The app uses installed Windows fonts when available
+  and falls back to its bundled fonts; no system font is redistributed. The capture
+  screen includes a live indicator, a transparent countdown overlay, and paper-style photo cards.
 - **Go fullscreen** enters guest mode with operator settings, studio controls,
-  camera details and file paths hidden. Outside an active capture, **Exit
-  fullscreen** restores the normal window controls. F11 also toggles fullscreen,
-  and Escape leaves OS fullscreen while keeping the current photo session.
+  camera details and file paths hidden. The guest screen is a portrait kiosk:
+  **Take picture** and **Exit fullscreen** at the top, the mirrored live preview
+  in the middle, and the shots from this session along the bottom. F11 also
+  toggles fullscreen, and Escape leaves OS fullscreen while keeping the current
+  photo session.
 - Live camera preview (webcam via Media Foundation, through `nokhwa`)
 - **Take picture** starts one countdown (1–10 s, configurable). After each shot,
   the booth waits for another click; guests choose when to take every picture.
   Failed captures can be retried without discarding completed photos.
-- During capture, the mirrored preview fills most of the application window
-  with just one **Take picture** button and photo progress. Operator controls
-  return on the review screen. The whole frame remains visible; saved photos
-  retain the original camera orientation.
+- Tap a captured photo in the filmstrip, then **Retake photo** to replace only
+  that shot. The original stays intact until the replacement succeeds. During
+  a retake countdown, **Keep original photo** cancels the replacement.
+- On the review screen, drag a photo directly onto another photo on the full
+  template to swap their positions. The highlighted frame shows the drop target;
+  dropping on the border or outside the template leaves the order unchanged.
+  Repeated slots for the same shot stay linked.
+- You can also select a thumbnail and use **Move earlier / Move later**
+  to arrange the print order, or **Retake photo** to try that shot again. The
+  preview, saved layout, and print use the same order; edits save a new version.
+- The bottom filmstrip has one slot per shot in the session — numbered
+  placeholders until each capture lands, with the newest shot outlined in the
+  accent color. Frames are uploaded to it as they arrive, so guests can judge a
+  shot before taking the next one. The whole camera frame remains visible;
+  saved photos keep the original camera orientation. Longer sessions wrap the
+  filmstrip on tall, narrow screens; compact windows keep a single row.
+- Photo review stacks the preview and print controls on portrait screens, with
+  selectable thumbnails and a new-session button. Wide screens place controls
+  beside the preview.
 - 1–8 shots per session (default 4)
 - Composes a classic vertical photo strip or a 2×2 grid with a border
 - **Layout studio**: a three-pane designer with editable text, PNG/JPEG images,

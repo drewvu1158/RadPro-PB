@@ -100,6 +100,39 @@ pub fn output_dimensions(kind: LayoutKind, count: usize, opts: &LayoutOptions) -
     }
 }
 
+/// A rendered photo cell in output pixels. Shared by composition and guest
+/// interaction so the clickable slots match the actual saved layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhotoCell {
+    pub shot: usize,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn photo_cells(count: usize, kind: LayoutKind, opts: &LayoutOptions) -> Vec<PhotoCell> {
+    let limit = match kind {
+        LayoutKind::Strip => count,
+        LayoutKind::Grid2x2 => count.min(4),
+    };
+    (0..limit)
+        .map(|shot| {
+            let (column, row) = match kind {
+                LayoutKind::Strip => (0, shot as u32),
+                LayoutKind::Grid2x2 => ((shot % 2) as u32, (shot / 2) as u32),
+            };
+            PhotoCell {
+                shot,
+                x: opts.margin + column * (opts.cell.0 + opts.gap),
+                y: opts.margin + row * (opts.cell.1 + opts.gap),
+                width: opts.cell.0,
+                height: opts.cell.1,
+            }
+        })
+        .collect()
+}
+
 /// Compose `shots` into a layout. For `Grid2x2` only the first 4 shots are used.
 pub fn compose(
     shots: &[DynamicImage],
@@ -112,30 +145,9 @@ pub fn compose(
     let (out_w, out_h) = output_dimensions(kind, shots.len(), opts);
     let mut canvas: ImageBuffer<Rgba<u8>, Vec<u8>> =
         ImageBuffer::from_pixel(out_w, out_h, Rgba(opts.background));
-    let (cw, ch) = opts.cell;
-
-    let cells = |index: usize| -> (u32, u32) {
-        match kind {
-            LayoutKind::Strip => (opts.margin, opts.margin + index as u32 * (ch + opts.gap)),
-            LayoutKind::Grid2x2 => {
-                let row = (index / 2) as u32;
-                let col = (index % 2) as u32;
-                (
-                    opts.margin + col * (cw + opts.gap),
-                    opts.margin + row * (ch + opts.gap),
-                )
-            }
-        }
-    };
-
-    let limit = match kind {
-        LayoutKind::Strip => shots.len(),
-        LayoutKind::Grid2x2 => shots.len().min(4),
-    };
-    for (index, shot) in shots.iter().take(limit).enumerate() {
-        let cell_img = cover_crop_resize(shot, opts.cell);
-        let (x, y) = cells(index);
-        image::imageops::overlay(&mut canvas, &cell_img, x as i64, y as i64);
+    for cell in photo_cells(shots.len(), kind, opts) {
+        let cell_img = cover_crop_resize(&shots[cell.shot], (cell.width, cell.height));
+        image::imageops::overlay(&mut canvas, &cell_img, cell.x as i64, cell.y as i64);
     }
     Ok(DynamicImage::ImageRgba8(canvas))
 }
@@ -169,8 +181,9 @@ mod tests {
         // width = cell + 2*margin, height = 3*cell + 2*gap + 2*margin
         assert_eq!(out.dimensions(), (120, 3 * 80 + 2 * 4 + 20));
         let rgba = out.to_rgba8();
-        assert_eq!(rgba.get_pixel(0, 0).0, [255, 255, 255, 255]); // border
-        assert_eq!(rgba.get_pixel(119, 267).0, [255, 255, 255, 255]); // border corner
+        // Border pixels.
+        assert_eq!(rgba.get_pixel(0, 0).0, [255, 255, 255, 255]);
+        assert_eq!(rgba.get_pixel(119, 267).0, [255, 255, 255, 255]);
         // Center of first cell should be the shot's red.
         assert_eq!(rgba.get_pixel(60, 50).0, [255, 0, 0, 255]);
         // Center of second cell should be green.

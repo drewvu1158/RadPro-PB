@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 fn timestamp() -> String {
-    chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
+    chrono::Local::now().format("%Y%m%d-%H%M%S-%f").to_string()
 }
 
 fn save_jpeg(image: &DynamicImage, path: &Path) -> io::Result<()> {

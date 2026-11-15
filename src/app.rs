@@ -19,6 +19,31 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Upload one captured shot as a filmstrip/review thumbnail. The camera frame
+/// is already 640×480, so `thumbnail` is a cheap no-op in the common case.
+fn shot_texture(ctx: &egui::Context, index: usize, shot: &DynamicImage) -> TextureHandle {
+    let rgba = shot.thumbnail(640, 480).to_rgba8();
+    ctx.load_texture(
+        format!("session-shot-{index}"),
+        egui::ColorImage::from_rgba_unmultiplied(
+            [rgba.width() as usize, rgba.height() as usize],
+            rgba.as_raw(),
+        ),
+        egui::TextureOptions::LINEAR,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PhotoReorder {
+    Move,
+    Swap,
+}
+
+#[derive(Clone, Copy)]
+struct DraggedPhoto {
+    index: usize,
+}
+
 pub struct SparkboothApp {
     settings: Settings,
     settings_path: PathBuf,
@@ -44,8 +69,8 @@ pub struct SparkboothApp {
     print_image: Option<DynamicImage>,
     shot_textures: Vec<TextureHandle>,
     review_selection: usize,
-    delivery_method: bool,
-    delivery_address: String,
+    selected_capture: Option<usize>,
+    last_capture: Option<usize>,
     print_feedback: Option<String>,
 }
 
@@ -55,6 +80,10 @@ impl SparkboothApp {
         simulate: bool,
         settings_path: Option<PathBuf>,
     ) -> Self {
+        Self::from_context(&cc.egui_ctx, simulate, settings_path)
+    }
+
+    fn from_context(ctx: &egui::Context, simulate: bool, settings_path: Option<PathBuf>) -> Self {
         let settings_path = settings_path.unwrap_or_else(default_settings_path);
         let mut status = String::new();
         let settings = match Settings::load(&settings_path) {
@@ -85,7 +114,7 @@ impl SparkboothApp {
             settings.countdown_seconds,
         );
         let editor = Editor::new(template.clone().unwrap_or_else(|| Template::builtin(false)));
-        theme::install(&cc.egui_ctx);
+        theme::install(ctx);
         Self {
             settings,
             settings_path,
@@ -111,8 +140,8 @@ impl SparkboothApp {
             print_image: None,
             shot_textures: Vec::new(),
             review_selection: 0,
-            delivery_method: false,
-            delivery_address: String::new(),
+            selected_capture: None,
+            last_capture: None,
             print_feedback: None,
         }
     }
@@ -216,12 +245,7 @@ impl SparkboothApp {
         };
         self.capture_rx = None;
         match result {
-            Ok(rgba) => {
-                self.shots.push(DynamicImage::ImageRgba8(rgba));
-                if self.booth.deliver_shot() == BoothEvent::StripComplete {
-                    self.compose_and_save(ctx);
-                }
-            }
+            Ok(rgba) => self.accept_capture(ctx, DynamicImage::ImageRgba8(rgba)),
             Err(error) => {
                 self.capture_error = Some(error);
                 self.booth.capture_failed();
@@ -229,12 +253,72 @@ impl SparkboothApp {
         }
     }
 
-    fn compose_and_save(&mut self, ctx: &egui::Context) {
-        self.last_strip = None;
-        self.print_image = None;
-        self.review_selection = 0;
-        self.print_feedback = None;
-        let opts = LayoutOptions {
+    /// Apply a completed capture to its original destination. Images and their
+    /// thumbnail projections are changed together, only after capture succeeds.
+    fn accept_capture(&mut self, ctx: &egui::Context, photo: DynamicImage) {
+        let index = self.booth.capture_index() as usize;
+        if self.booth.phase() != Phase::Shooting || index > self.shots.len() {
+            return;
+        }
+        let texture = shot_texture(ctx, index, &photo);
+        if index == self.shots.len() {
+            self.shots.push(photo);
+            self.shot_textures.push(texture);
+        } else {
+            self.shots[index] = photo;
+            self.shot_textures[index] = texture;
+        }
+        self.selected_capture = None;
+        self.last_capture = Some(index);
+        if self.booth.deliver_shot() == BoothEvent::StripComplete {
+            self.compose_and_save(ctx);
+        }
+    }
+
+    fn request_retake(&mut self, index: usize) {
+        if index < self.shots.len() && self.booth.request_retake(index as u32) {
+            self.selected_capture = Some(index);
+            self.review_selection = index + 1;
+            self.capture_error = None;
+        }
+    }
+
+    /// The photo and its thumbnail have one order; composition and printing
+    /// consume that same order. Moving is only allowed on the review screen.
+    fn reorder_photos(
+        &mut self,
+        ctx: &egui::Context,
+        operation: PhotoReorder,
+        from: usize,
+        to: usize,
+    ) -> bool {
+        if self.booth.phase() != Phase::Review
+            || from == to
+            || from >= self.shots.len()
+            || to >= self.shots.len()
+        {
+            return false;
+        }
+        match operation {
+            PhotoReorder::Move => {
+                let photo = self.shots.remove(from);
+                self.shots.insert(to, photo);
+                let texture = self.shot_textures.remove(from);
+                self.shot_textures.insert(to, texture);
+            }
+            PhotoReorder::Swap => {
+                self.shots.swap(from, to);
+                self.shot_textures.swap(from, to);
+            }
+        }
+        self.last_capture = None;
+        self.compose_and_save(ctx);
+        self.review_selection = to + 1;
+        true
+    }
+
+    fn layout_options(&self) -> LayoutOptions {
+        LayoutOptions {
             cell: (640, 480),
             margin: 36,
             gap: 14,
@@ -243,7 +327,16 @@ impl SparkboothApp {
             } else {
                 [16, 16, 18, 255]
             },
-        };
+        }
+    }
+
+    fn compose_and_save(&mut self, ctx: &egui::Context) {
+        self.last_strip = None;
+        self.print_image = None;
+        self.review_texture = None;
+        self.review_selection = 0;
+        self.print_feedback = None;
+        let opts = self.layout_options();
         let composed = match &self.session_template {
             Some(template) => template.render(&self.shots, None),
             None => {
@@ -276,27 +369,17 @@ impl SparkboothApp {
                 self.review_texture =
                     Some(ctx.load_texture("review-strip", image, egui::TextureOptions::LINEAR));
                 self.print_image = Some(strip);
-                self.shot_textures = self
-                    .shots
-                    .iter()
-                    .enumerate()
-                    .map(|(i, shot)| {
-                        let rgba = shot.thumbnail(640, 480).to_rgba8();
-                        ctx.load_texture(
-                            format!("review-shot-{i}"),
-                            egui::ColorImage::from_rgba_unmultiplied(
-                                [rgba.width() as usize, rgba.height() as usize],
-                                rgba.as_raw(),
-                            ),
-                            egui::TextureOptions::LINEAR,
-                        )
-                    })
-                    .collect();
+                debug_assert_eq!(
+                    self.shot_textures.len(),
+                    self.shots.len(),
+                    "one filmstrip thumbnail per captured shot"
+                );
             }
             Err(e) => {
                 self.status = format!("could not compose strip: {e}");
-                self.booth.retake();
-                self.shots.clear();
+                self.capture_error = Some(format!(
+                    "Could not prepare the layout: {e}. Your photos are still here."
+                ));
             }
         }
     }
@@ -310,7 +393,8 @@ impl SparkboothApp {
         self.print_image = None;
         self.shot_textures.clear();
         self.review_selection = 0;
-        self.delivery_address.clear();
+        self.selected_capture = None;
+        self.last_capture = None;
         self.print_feedback = None;
         self.last_strip = None;
         self.session_template = None;
@@ -324,97 +408,417 @@ impl SparkboothApp {
             self.last_strip = None;
             self.show_settings = false;
             self.show_editor = false;
+            self.shots.clear();
+            self.shot_textures.clear();
         }
         self.capture_error = None;
-        self.booth.request_shot();
+        if let Some(index) = self.selected_capture {
+            self.request_retake(index);
+        } else {
+            self.booth.request_shot();
+        }
     }
 
-    /// Fit the whole camera frame, mirror only the preview, and leave a single
-    /// guest control. Saved shots retain their original camera orientation.
-    fn booth_page(&mut self, ui: &mut egui::Ui) {
-        let available = ui.available_size();
-        let picture_area = Vec2::new(available.x, (available.y - 100.0).max(60.0));
-        let (area, _) = ui.allocate_exact_size(picture_area, egui::Sense::hover());
-        let painter = ui.painter_at(area);
-        if let Some(texture) = &self.preview_texture {
-            let ts = texture.size_vec2();
-            let size = ts * (area.width() / ts.x).min(area.height() / ts.y);
-            let image_rect = egui::Rect::from_center_size(area.center(), size);
-            painter.image(
-                texture.id(),
-                image_rect,
-                egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0)),
-                Color32::WHITE,
-            );
-            if self.booth.phase() == Phase::Countdown {
-                let radius = (image_rect.height() * 0.16).clamp(40.0, 100.0);
-                painter.circle_filled(
-                    image_rect.center(),
-                    radius,
-                    theme::BACKGROUND.gamma_multiply(0.9),
-                );
-                painter.text(
-                    image_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    self.booth.remaining_seconds().to_string(),
-                    theme::editorial(radius * 1.2),
-                    theme::TEXT,
-                );
-            }
-        } else {
-            painter.text(
-                area.center(),
-                egui::Align2::CENTER_CENTER,
-                "Connecting to the camera...",
-                egui::FontId::proportional(20.0),
-                theme::MUTED,
-            );
-        }
-        ui.add_space(10.0);
-        ui.vertical_centered(|ui| {
-            let ready = self.booth.ready_for_picture()
-                && self.preview_texture.is_some()
-                && self.template_error.is_none();
-            if ui
-                .add_enabled(
-                    ready,
-                    egui::Button::new(
-                        RichText::new("Take picture")
-                            .size(22.0)
-                            .color(theme::ON_ACCENT),
-                    )
-                    .fill(theme::ACCENT)
-                    .corner_radius(8)
-                    .min_size(Vec2::new(280.0, 56.0)),
-                )
-                .clicked()
-            {
-                self.request_picture();
-            }
-            if let Some(error) = self.capture_error.as_ref().or(self.template_error.as_ref()) {
-                ui.add(
-                    egui::Label::new(RichText::new(error).size(12.0).color(theme::ACCENT))
-                        .truncate(),
-                )
-                .on_hover_text(error);
-            } else {
-                let state = match self.booth.phase() {
-                    Phase::Ready => " / ready when you are",
-                    Phase::Shooting => " / taking picture...",
-                    _ => "",
-                };
-                ui.label(
-                    RichText::new(format!(
-                        "Photo {} of {}{}",
-                        (self.booth.shots_taken() + 1).min(self.booth.shots_wanted()),
-                        self.booth.shots_wanted(),
-                        state
-                    ))
-                    .size(12.0)
-                    .color(theme::MUTED),
-                );
+    fn guest_masthead(&mut self, ui: &mut egui::Ui, fullscreen: bool) {
+        ui.horizontal(|ui| {
+            theme::brand(ui);
+            if fullscreen {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Exit fullscreen").size(13.0))
+                                .min_size(Vec2::new(132.0, 38.0))
+                                .corner_radius(20),
+                        )
+                        .clicked()
+                    {
+                        self.set_fullscreen(ui.ctx(), false);
+                    }
+                });
             }
         });
+    }
+
+    /// Portrait kiosk: the capture action stays above the full camera frame,
+    /// with session photos below it. Compact windows use the same hierarchy.
+    fn booth_page(&mut self, ui: &mut egui::Ui, fullscreen: bool) {
+        let available_height = ui.available_height();
+        let compact = available_height < 720.0;
+        egui::Panel::top("booth_take")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 4)))
+            .show(ui, |ui| {
+                self.guest_masthead(ui, fullscreen);
+                ui.add_space(if compact { 10.0 } else { 24.0 });
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("Make a little memory.")
+                            .font(theme::editorial(if compact { 32.0 } else { 44.0 }))
+                            .color(theme::TEXT),
+                    );
+                    if !compact {
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new("Strike a pose. Take a photo. Make it yours.")
+                                .size(15.0)
+                                .color(theme::MUTED),
+                        );
+                    }
+                    ui.add_space(if compact { 10.0 } else { 18.0 });
+                    let ready = self.booth.ready_for_picture()
+                        && self.preview_texture.is_some()
+                        && self.template_error.is_none();
+                    let label = match self.booth.phase() {
+                        Phase::Countdown => "Get ready...".to_owned(),
+                        Phase::Shooting => "Taking picture...".to_owned(),
+                        _ => self
+                            .selected_capture
+                            .map(|index| format!("Retake photo {}", index + 1))
+                            .unwrap_or_else(|| "Take picture".to_owned()),
+                    };
+                    let size = Vec2::new(
+                        ui.available_width().min(330.0),
+                        if compact { 54.0 } else { 64.0 },
+                    );
+                    if theme::primary_button(ui, &label, size, ready).clicked() {
+                        self.request_picture();
+                    }
+                    ui.add_space(4.0);
+                    if self.booth.retaking_index().is_some() {
+                        if ui
+                            .add_enabled(
+                                self.booth.phase() == Phase::Countdown,
+                                egui::Button::new("Keep original photo").corner_radius(20),
+                            )
+                            .clicked()
+                        {
+                            self.booth.cancel_retake();
+                            self.capture_error = None;
+                        }
+                    } else if self.selected_capture.is_some() && self.booth.ready_for_picture() {
+                        if ui.button("Back to live camera").clicked() {
+                            self.selected_capture = None;
+                        }
+                    }
+                    let hint = match self.booth.phase() {
+                        Phase::Countdown => "Look at the camera and hold that pose.",
+                        Phase::Shooting => "One moment. Capturing your photo.",
+                        Phase::Ready => "Tap a photo below to review or retake it.",
+                        _ => "A short countdown, then your moment in the spotlight.",
+                    };
+                    ui.label(RichText::new(hint).size(12.0).color(theme::MUTED));
+                });
+                if let Some(error) = self.capture_error.as_ref().or(self.template_error.as_ref()) {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(error).size(13.0).color(theme::ACCENT));
+                }
+            });
+
+        let slots = self.booth.shots_wanted().max(1) as usize;
+        egui::Panel::bottom("booth_filmstrip")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 10)))
+            .show(ui, |ui| {
+                let width = ui.available_width();
+                let columns = slots.min(if width < 1000.0 && !compact { 4 } else { 8 });
+                let gap = if width < 700.0 { 10.0 } else { 14.0 };
+                let rows = slots.div_ceil(columns);
+                let filmstrip_share = if rows > 1 { 0.32 } else { 0.24 };
+                let max_cell_h =
+                    ((available_height * filmstrip_share - 54.0) / rows as f32).max(54.0);
+                let mut cell_w = ((width - gap * (columns - 1) as f32) / columns as f32).min(220.0);
+                let footer = if cell_w < 100.0 { 30.0 } else { 40.0 };
+                cell_w = cell_w.min(((max_cell_h - footer) / 0.75 + 12.0).max(40.0));
+                let image_h = (cell_w - 12.0).max(1.0) * 0.75;
+                let cell_h = image_h + if cell_w < 100.0 { 30.0 } else { 40.0 };
+                ui.horizontal(|ui| {
+                    ui.label(theme::eyebrow("THE GOOD TIMES"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} / {} captured",
+                                self.booth.shots_taken(),
+                                slots
+                            ))
+                            .size(12.0)
+                            .color(theme::MUTED),
+                        );
+                    });
+                });
+                ui.add_space(3.0);
+                let progress_width = (width - gap * (slots - 1) as f32) / slots as f32;
+                let (progress, _) =
+                    ui.allocate_exact_size(Vec2::new(width, 3.0), egui::Sense::hover());
+                for index in 0..slots {
+                    let segment = egui::Rect::from_min_size(
+                        progress.min + Vec2::new(index as f32 * (progress_width + gap), 0.0),
+                        Vec2::new(progress_width, 2.0),
+                    );
+                    ui.painter().rect_filled(
+                        segment,
+                        1.0,
+                        if index < self.shot_textures.len() {
+                            theme::ACCENT
+                        } else {
+                            theme::BORDER
+                        },
+                    );
+                }
+                ui.add_space(9.0);
+                for first in (0..slots).step_by(columns) {
+                    let count = (slots - first).min(columns);
+                    let total = count as f32 * cell_w + (count - 1) as f32 * gap;
+                    let (row, _) =
+                        ui.allocate_exact_size(Vec2::new(width, cell_h), egui::Sense::hover());
+                    let start = row.center().x - total / 2.0;
+                    for column in 0..count {
+                        let cell = egui::Rect::from_min_size(
+                            egui::pos2(start + column as f32 * (cell_w + gap), row.top()),
+                            Vec2::new(cell_w, cell_h),
+                        );
+                        let index = first + column;
+                        if self.paint_filmstrip_cell(ui, cell, index) {
+                            self.selected_capture = Some(index);
+                        }
+                    }
+                }
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(4, 16)))
+            .show(ui, |ui| {
+                let (area, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+                self.paint_preview(ui, area);
+            });
+    }
+
+    /// Fit the full, mirrored frame inside the card; the saved shot is unchanged.
+    fn paint_preview(&self, ui: &egui::Ui, area: egui::Rect) {
+        if area.width() < 20.0 || area.height() < 20.0 {
+            return;
+        }
+        let painter = ui.painter_at(area);
+        let selected = self
+            .selected_capture
+            .filter(|_| self.booth.ready_for_picture());
+        let texture = selected
+            .and_then(|index| self.shot_textures.get(index))
+            .or(self.preview_texture.as_ref());
+        let Some(texture) = texture else {
+            painter.rect_filled(area, 18.0, theme::SURFACE);
+            painter.text(
+                area.center() - Vec2::new(0.0, 16.0),
+                egui::Align2::CENTER_CENTER,
+                "Getting the camera ready",
+                theme::editorial(26.0),
+                theme::TEXT,
+            );
+            painter.text(
+                area.center() + Vec2::new(0.0, 20.0),
+                egui::Align2::CENTER_CENTER,
+                "Your live preview will appear here.",
+                egui::FontId::proportional(14.0),
+                theme::MUTED,
+            );
+            return;
+        };
+        let ts = texture.size_vec2();
+        let available = (area.size() - Vec2::new(12.0, 34.0)).max(Vec2::splat(1.0));
+        let size = ts * (available.x / ts.x).min(available.y / ts.y);
+        let image_rect = egui::Rect::from_center_size(area.center() - Vec2::new(0.0, 10.0), size);
+        let card = image_rect.expand(5.0);
+        painter.rect_filled(card, 18.0, theme::SURFACE);
+        painter.rect_stroke(
+            card,
+            18.0,
+            egui::Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
+        egui::Image::from_texture(SizedTexture::new(texture.id(), size))
+            .uv(egui::Rect::from_min_max(
+                egui::pos2(if selected.is_some() { 0.0 } else { 1.0 }, 0.0),
+                egui::pos2(if selected.is_some() { 1.0 } else { 0.0 }, 1.0),
+            ))
+            .corner_radius(14)
+            .paint_at(ui, image_rect);
+
+        if selected.is_none() && image_rect.width() > 260.0 && image_rect.height() > 160.0 {
+            let badge = egui::Rect::from_min_size(
+                image_rect.min + Vec2::splat(14.0),
+                Vec2::new(80.0, 28.0),
+            );
+            painter.rect_filled(badge, 14.0, Color32::from_black_alpha(185));
+            painter.circle_filled(badge.min + Vec2::new(15.0, 14.0), 3.0, theme::LIVE);
+            painter.text(
+                badge.min + Vec2::new(28.0, 14.0),
+                egui::Align2::LEFT_CENTER,
+                "LIVE",
+                theme::button_font(10.0),
+                theme::TEXT,
+            );
+        }
+        painter.text(
+            egui::pos2(image_rect.center().x, card.bottom() + 16.0),
+            egui::Align2::CENTER_CENTER,
+            selected
+                .map(|index| format!("PHOTO {}  /  SELECT RETAKE TO TRY AGAIN", index + 1))
+                .unwrap_or_else(|| "LIVE PREVIEW  /  MIRRORED".to_owned()),
+            egui::FontId::proportional(10.0),
+            theme::MUTED,
+        );
+        if self.booth.phase() == Phase::Countdown {
+            let radius = (image_rect.height() * 0.18).clamp(35.0, 90.0);
+            let center = image_rect.center();
+            // No filled disk: guests can see their pose through the countdown.
+            painter.circle_stroke(
+                center,
+                radius,
+                egui::Stroke::new(1.0, Color32::from_white_alpha(70)),
+            );
+            let fraction = (self.booth.remaining_ms() as f32
+                / (self.settings.countdown_seconds.max(1) as f32 * 1000.0))
+                .clamp(0.0, 1.0);
+            let points = (0..=64)
+                .map(|i| {
+                    let angle = -std::f32::consts::FRAC_PI_2
+                        + std::f32::consts::TAU * fraction * i as f32 / 64.0;
+                    center + Vec2::angled(angle) * (radius - 4.0)
+                })
+                .collect();
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(2.0, theme::ACCENT),
+            ));
+            painter.text(
+                center - Vec2::new(0.0, radius * 0.08),
+                egui::Align2::CENTER_CENTER,
+                self.booth.remaining_seconds().to_string(),
+                theme::editorial(radius * 1.12),
+                Color32::from_white_alpha(205),
+            );
+            if radius >= 55.0 {
+                painter.text(
+                    center + Vec2::new(0.0, radius * 0.55),
+                    egui::Align2::CENTER_CENTER,
+                    "HOLD THAT POSE",
+                    theme::button_font(9.0),
+                    theme::ACCENT,
+                );
+            }
+        }
+    }
+
+    /// Captured frames become little paper prints. Empty slots keep their place
+    /// and clearly identify the next shot without implying it was captured.
+    fn paint_filmstrip_cell(&self, ui: &egui::Ui, cell: egui::Rect, index: usize) -> bool {
+        let painter = ui.painter();
+        let texture = self.shot_textures.get(index);
+        let latest = self.last_capture == Some(index);
+        let selected = self.selected_capture == Some(index);
+        let enabled = texture.is_some() && self.booth.ready_for_picture();
+        let response = ui.interact(
+            cell,
+            ui.scope_id().with(("captured-photo", index)),
+            if enabled {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
+        if texture.is_some() {
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::accesskit::Role::Button,
+                    enabled,
+                    format!("View photo {}", index + 1),
+                )
+            });
+        }
+        let next = index == self.shot_textures.len();
+        let narrow = cell.width() < 100.0;
+        let footer = if narrow { 24.0 } else { 34.0 };
+        painter.rect_filled(
+            cell,
+            10.0,
+            if texture.is_some() {
+                theme::TEXT
+            } else {
+                theme::SURFACE
+            },
+        );
+        painter.rect_stroke(
+            cell,
+            10.0,
+            egui::Stroke::new(
+                if selected {
+                    3.0
+                } else if latest {
+                    2.0
+                } else {
+                    1.0
+                },
+                if selected || latest || next {
+                    theme::ACCENT
+                } else {
+                    theme::BORDER
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let image_area = egui::Rect::from_min_max(
+            cell.min + Vec2::splat(6.0),
+            cell.max - Vec2::new(6.0, footer),
+        );
+        let ink = if texture.is_some() {
+            theme::ON_ACCENT
+        } else {
+            theme::MUTED
+        };
+        if let Some(texture) = texture {
+            painter.rect_filled(image_area, 5.0, Color32::BLACK);
+            let ts = texture.size_vec2();
+            let size = ts * (image_area.width() / ts.x).min(image_area.height() / ts.y);
+            egui::Image::from_texture(SizedTexture::new(texture.id(), size))
+                .corner_radius(4)
+                .paint_at(ui, egui::Rect::from_center_size(image_area.center(), size));
+        } else {
+            painter.text(
+                image_area.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{:02}", index + 1),
+                theme::editorial(if narrow { 22.0 } else { 32.0 }),
+                if next { theme::ACCENT } else { theme::BORDER },
+            );
+        }
+        let baseline = cell.bottom() - footer / 2.0;
+        painter.text(
+            egui::pos2(cell.left() + 12.0, baseline),
+            egui::Align2::LEFT_CENTER,
+            format!("{:02}", index + 1),
+            theme::button_font(10.0),
+            ink,
+        );
+        if !narrow {
+            let label = if selected {
+                "SELECTED"
+            } else if latest {
+                "JUST TAKEN"
+            } else if texture.is_some() {
+                "CAPTURED"
+            } else if next {
+                "UP NEXT"
+            } else {
+                ""
+            };
+            painter.text(
+                egui::pos2(cell.right() - 12.0, baseline),
+                egui::Align2::RIGHT_CENTER,
+                label,
+                egui::FontId::proportional(9.0),
+                ink,
+            );
+        }
+        response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
     }
 
     fn apply_template(&mut self, template: Template) {
@@ -436,114 +840,410 @@ impl SparkboothApp {
     }
 
     fn review_page(&mut self, ui: &mut egui::Ui, fullscreen: bool) {
-        let width = ui.available_width().min(1500.0);
-        let height = ui.available_height();
-        ui.vertical_centered(|ui| {
-            ui.allocate_ui_with_layout(
-                Vec2::new(width, height),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| self.review_content(ui, fullscreen),
-            );
-        });
+        self.guest_masthead(ui, fullscreen);
+        ui.add_space(20.0);
+        // The scroll content has unbounded height; size the preview from the viewport.
+        let viewport_height = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("review_page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label(theme::eyebrow("THAT'S A KEEPER"));
+                let mut start_again = false;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Your photos, your memories.")
+                            .font(theme::editorial(if ui.available_width() < 800.0 {
+                                30.0
+                            } else {
+                                38.0
+                            }))
+                            .color(theme::TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        start_again = ui
+                            .add(
+                                egui::Button::new("Start again")
+                                    .min_size(Vec2::new(125.0, 42.0))
+                                    .corner_radius(24),
+                            )
+                            .clicked();
+                    });
+                });
+                if start_again {
+                    self.reset_session();
+                    return;
+                }
+                if let Some(error) = &self.capture_error {
+                    ui.label(RichText::new(error).color(theme::ACCENT));
+                }
+                ui.label(
+                    RichText::new(
+                        "Drag photos on the template to arrange them, then print your collection.",
+                    )
+                    .size(14.0)
+                    .color(theme::MUTED),
+                );
+                ui.add_space(20.0);
+                let width = ui.available_width();
+                if width < 950.0 {
+                    let preview_height = (viewport_height * 0.48).clamp(180.0, 520.0);
+                    self.review_preview(ui, width, preview_height);
+                    ui.add_space(18.0);
+                    self.review_actions(ui, width, fullscreen);
+                } else {
+                    let preview_width = width - 340.0;
+                    let preview_height = (viewport_height - 220.0).max(180.0);
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(preview_width, 0.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                self.review_preview(ui, preview_width, preview_height);
+                            },
+                        );
+                        ui.add_space(14.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(310.0, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                self.review_actions(ui, 310.0, fullscreen);
+                            },
+                        );
+                    });
+                }
+            });
     }
 
-    fn review_content(&mut self, ui: &mut egui::Ui, fullscreen: bool) {
-        ui.label(
-            RichText::new("REVIEW")
-                .size(12.0)
-                .strong()
-                .color(theme::ACCENT),
+    fn review_preview(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
+        let controls_top = ui.cursor().top();
+        self.review_photo_controls(ui);
+        ui.add_space(12.0);
+        let controls_height = ui.cursor().top() - controls_top;
+        let height = (height - controls_height).max(140.0);
+        let (area, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+        let texture = if self.review_selection == 0 {
+            self.review_texture.as_ref()
+        } else {
+            self.shot_textures.get(self.review_selection - 1)
+        };
+        ui.painter().rect_filled(area, 18.0, theme::SURFACE);
+        ui.painter().rect_stroke(
+            area,
+            18.0,
+            egui::Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Inside,
         );
-        let mut next_guest = false;
-        ui.horizontal(|ui| {
-            ui.heading(
-                RichText::new("Your photos.")
-                    .font(theme::editorial(36.0))
-                    .color(theme::TEXT),
+        if let Some(texture) = texture {
+            let ts = texture.size_vec2();
+            let available = area.shrink(16.0).size();
+            let size = ts * (available.x / ts.x).min(available.y / ts.y);
+            let image_rect = egui::Rect::from_center_size(area.center(), size);
+            egui::Image::from_texture(SizedTexture::new(texture.id(), size))
+                .corner_radius(6)
+                .paint_at(ui, image_rect);
+            if self.review_selection == 0 {
+                self.interact_template(ui, image_rect);
+            }
+        } else {
+            ui.painter().text(
+                area.center(),
+                egui::Align2::CENTER_CENTER,
+                "The photo layout could not be prepared.",
+                egui::FontId::proportional(15.0),
+                theme::MUTED,
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                next_guest = ui
-                    .add_sized(
-                        [250.0, 42.0],
-                        egui::Button::new(RichText::new("Start again").size(16.0))
-                            .fill(theme::SURFACE_HOVER)
-                            .corner_radius(8),
-                    )
-                    .clicked();
+        }
+        ui.add_space(12.0);
+        egui::ScrollArea::horizontal()
+            .id_salt("review_thumbnails")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("ALL").font(theme::button_font(14.0)),
+                                )
+                                .min_size(Vec2::new(82.0, 60.0))
+                                .selected(self.review_selection == 0)
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    if self.review_selection == 0 {
+                                        theme::ACCENT
+                                    } else {
+                                        theme::BORDER
+                                    },
+                                ))
+                                .corner_radius(10),
+                            )
+                            .clicked()
+                        {
+                            self.review_selection = 0;
+                        }
+                        ui.label(RichText::new("Full layout").size(11.0).color(theme::MUTED));
+                    });
+                    for (index, texture) in self.shot_textures.iter().enumerate() {
+                        ui.vertical(|ui| {
+                            let response = ui.add(
+                                egui::Button::image(
+                                    egui::Image::from_texture(SizedTexture::new(
+                                        texture.id(),
+                                        Vec2::new(72.0, 54.0),
+                                    ))
+                                    .corner_radius(5)
+                                    .alt_text(format!("View photo {}", index + 1)),
+                                )
+                                .selected(self.review_selection == index + 1)
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    if self.review_selection == index + 1 {
+                                        theme::ACCENT
+                                    } else {
+                                        theme::BORDER
+                                    },
+                                ))
+                                .corner_radius(10),
+                            );
+                            if response.clicked() {
+                                self.review_selection = index + 1;
+                            }
+                            ui.label(
+                                RichText::new(format!("Photo {:02}", index + 1))
+                                    .size(11.0)
+                                    .color(theme::MUTED),
+                            );
+                        });
+                    }
+                });
             });
+    }
+
+    fn review_regions(&self) -> Vec<(usize, crate::design::Frame)> {
+        if let Some(template) = &self.session_template {
+            template
+                .photo_regions()
+                .filter(|(index, _)| *index < self.shots.len())
+                .collect()
+        } else {
+            layout::photo_cells(
+                self.shots.len(),
+                self.settings.layout,
+                &self.layout_options(),
+            )
+            .into_iter()
+            .map(|cell| {
+                (
+                    cell.shot,
+                    crate::design::Frame::new(
+                        cell.x as f64,
+                        cell.y as f64,
+                        cell.width as f64,
+                        cell.height as f64,
+                    ),
+                )
+            })
+            .collect()
+        }
+    }
+
+    fn template_photo_at(&self, rect: egui::Rect, pointer: egui::Pos2) -> Option<usize> {
+        if !rect.contains(pointer) {
+            return None;
+        }
+        let image = self.print_image.as_ref()?;
+        let x = ((pointer.x - rect.left()) / rect.width()) as f64 * image.width() as f64;
+        let y = ((pointer.y - rect.top()) / rect.height()) as f64 * image.height() as f64;
+        self.review_regions()
+            .into_iter()
+            .rev()
+            .find_map(|(index, frame)| frame.contains(x, y).then_some(index))
+    }
+
+    /// One drag surface uses exact rotated photo regions, rather than competing
+    /// bounding-box widgets. Esc and drops outside a photo leave the order intact.
+    fn interact_template(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let response = ui.interact(
+            rect,
+            ui.scope_id().with("arrange-template"),
+            egui::Sense::click_and_drag(),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::accesskit::Role::Image,
+                true,
+                "Photo template: drag a photo onto another photo to swap their positions",
+            )
         });
-        if next_guest {
-            self.reset_session();
+        if self.booth.phase() != Phase::Review {
             return;
         }
-        ui.label(
-            RichText::new("View your photos or print the complete layout.").color(theme::MUTED),
-        );
-        ui.add_space(14.0);
-        ui.horizontal_top(|ui| {
-            let preview_width = (ui.available_width() - 350.0).max(200.0);
-            ui.allocate_ui_with_layout(Vec2::new(preview_width,(ui.available_height()-8.0).max(150.0)),egui::Layout::top_down(egui::Align::Center),|ui| {
-                theme::card().inner_margin(12).show(ui,|ui| {
-                    let tex = if self.review_selection==0 { self.review_texture.as_ref() } else { self.shot_textures.get(self.review_selection-1) };
-                    if let Some(tex) = tex {
-                        let available = Vec2::new((preview_width-24.0).max(80.0),(ui.available_height()-142.0).max(80.0));
-                        let ts=tex.size_vec2(); let scale=(available.x/ts.x).min(available.y/ts.y);
-                        ui.add(egui::Image::from_texture(SizedTexture::new(tex.id(),ts*scale)).corner_radius(8));
-                    }
-                });
-                ui.add_space(12.0);
-                egui::ScrollArea::horizontal().id_salt("review_thumbnails").max_height(100.0).show(ui,|ui| {
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(self.review_selection==0,"Complete layout").clicked() { self.review_selection=0; }
-                        for (i,t) in self.shot_textures.iter().enumerate() {
-                            ui.vertical(|ui| {
-                                if ui.add(egui::Image::from_texture(SizedTexture::new(t.id(),Vec2::new(72.0,54.0))).corner_radius(8).sense(egui::Sense::click())).clicked() { self.review_selection=i+1; }
-                                if ui.selectable_label(self.review_selection==i+1,format!("Photo {}",i+1)).clicked() { self.review_selection=i+1; }
-                            });
-                        }
+        if response.drag_started() {
+            if let Some(index) = ui
+                .input(|input| input.pointer.press_origin())
+                .and_then(|point| self.template_photo_at(rect, point))
+            {
+                egui::DragAndDrop::set_payload(ui.ctx(), DraggedPhoto { index });
+            }
+        }
+        let pointer = ui.input(|input| input.pointer.interact_pos());
+        let target = pointer.and_then(|point| self.template_photo_at(rect, point));
+        let payload = egui::DragAndDrop::payload::<DraggedPhoto>(ui.ctx());
+        if response.hovered() && target.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        if let Some(drag) = payload.as_ref() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let image = self.print_image.as_ref().unwrap();
+            let size = Vec2::new(image.width() as f32, image.height() as f32);
+            let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+            for (index, frame) in self.review_regions() {
+                if Some(index) == target || index == drag.index {
+                    let points = frame.corners().map(|(x, y)| {
+                        rect.min + Vec2::new(x as f32 / size.x, y as f32 / size.y) * rect.size()
                     });
-                });
+                    painter.add(egui::Shape::closed_line(
+                        points.to_vec(),
+                        egui::Stroke::new(
+                            if Some(index) == target { 3.0 } else { 1.0 },
+                            theme::ACCENT,
+                        ),
+                    ));
+                }
+            }
+            if let Some(point) = pointer.filter(|point| rect.contains(*point)) {
+                if let Some(texture) = self.shot_textures.get(drag.index) {
+                    let ghost = egui::Rect::from_min_size(
+                        point + Vec2::new(14.0, 14.0),
+                        Vec2::new(88.0, 66.0),
+                    );
+                    painter.rect_filled(ghost.expand(4.0), 6.0, Color32::from_black_alpha(180));
+                    painter.image(
+                        texture.id(),
+                        ghost,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        Color32::from_white_alpha(200),
+                    );
+                }
+            }
+        }
+        if let Some(drag) = response.dnd_release_payload::<DraggedPhoto>() {
+            if let Some(target) = target {
+                if self.reorder_photos(ui.ctx(), PhotoReorder::Swap, drag.index, target) {
+                    self.review_selection = 0;
+                }
+            }
+        }
+    }
+
+    fn review_photo_controls(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(12.0);
+        if let Some(index) = self.review_selection.checked_sub(1) {
+            let count = self.shots.len();
+            let mut destination = None;
+            let mut retake = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("Photo {} of {}", index + 1, count)).color(theme::MUTED),
+                );
+                if ui
+                    .add_enabled(index > 0, egui::Button::new("Move earlier"))
+                    .clicked()
+                {
+                    destination = Some(index - 1);
+                }
+                if ui
+                    .add_enabled(index + 1 < count, egui::Button::new("Move later"))
+                    .clicked()
+                {
+                    destination = Some(index + 1);
+                }
+                retake = ui.button(format!("Retake photo {}", index + 1)).clicked();
             });
-            ui.add_space(12.0);
-            ui.allocate_ui_with_layout(Vec2::new(320.0,ui.available_height()),egui::Layout::top_down(egui::Align::LEFT),|ui| {
-                egui::ScrollArea::vertical().id_salt("review_actions").show(ui,|ui| {
-                    ui.set_max_width(310.0);
-                    theme::card().fill(theme::SURFACE).show(ui,|ui| {
-                        ui.set_width(270.0);
-                                                ui.heading("Print photos");
-                        ui.label("Choose your printer, paper size, and copies.");
-                        ui.add_space(8.0);
-                        if ui.add_enabled(self.print_image.is_some(),egui::Button::new(RichText::new("Print layout").size(19.0).color(theme::ON_ACCENT)).min_size(Vec2::new(265.0,56.0)).fill(theme::ACCENT).corner_radius(8)).clicked() {
-                            if let Some(image)=&self.print_image {
-                                self.print_feedback=Some(match printing::print_image(image,None) {
-                                    Ok(PrintOutcome::Submitted{job_id}) => format!("Print job {job_id} sent to the printer"),
-                                    Ok(PrintOutcome::Cancelled) => "Printing cancelled. Your photos are still here.".into(),
-                                    Err(e) => format!("Printing failed: {e}"),
-                                });
-                            }
+            if let Some(to) = destination {
+                self.reorder_photos(ui.ctx(), PhotoReorder::Move, index, to);
+            }
+            if retake {
+                self.request_retake(index);
+            }
+        } else {
+            ui.label(
+                RichText::new("Drag photos onto each other on the template to swap them. Tap a thumbnail to retake.")
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+        }
+    }
+
+    fn review_actions(&mut self, ui: &mut egui::Ui, width: f32, fullscreen: bool) {
+        let inner_width = (width - 40.0).max(100.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(inner_width);
+            ui.label(theme::eyebrow("A LITTLE SOMETHING TO KEEP"));
+            ui.add_space(4.0);
+            ui.label(RichText::new("Take the memories home.").font(theme::editorial(25.0)));
+            ui.label(
+                RichText::new("Print your complete photo layout.")
+                    .size(14.0)
+                    .color(theme::MUTED),
+            );
+            ui.add_space(14.0);
+            if theme::primary_button(
+                ui,
+                "Print photos",
+                Vec2::new(inner_width, 54.0),
+                self.print_image.is_some() && self.booth.phase() == Phase::Review,
+            )
+            .clicked()
+            {
+                if let Some(image) = &self.print_image {
+                    self.print_feedback = Some(match printing::print_image(image, None) {
+                        Ok(PrintOutcome::Submitted { job_id }) => {
+                            format!("Print job {job_id} sent to the printer")
                         }
-                        if let Some(feedback)=&self.print_feedback { ui.add_space(6.0); ui.label(feedback); }
+                        Ok(PrintOutcome::Cancelled) => {
+                            "Printing cancelled. Your photos are still here.".into()
+                        }
+                        Err(error) => format!("Printing failed: {error}"),
                     });
-                    ui.add_space(12.0);
-                    theme::card().show(ui,|ui| {
-                        ui.set_width(270.0);
-                        theme::pill(ui,"COMING SOON",theme::SURFACE_HOVER);
-                        ui.heading("Send photos");
-                        ui.label("Email and text delivery will be available soon.");
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| { ui.selectable_value(&mut self.delivery_method,false,"Email"); ui.selectable_value(&mut self.delivery_method,true,"Text message"); });
-                        ui.add_enabled_ui(false,|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.delivery_address).desired_width(255.0).hint_text(if self.delivery_method {"Phone number"} else {"Email address"}));
-                            ui.add_sized([265.0,40.0],egui::Button::new("Send photos"));
-                        });
-                    });
-                    ui.add_space(12.0);
-                    if !fullscreen {
-                        if let Some(path)=&self.last_strip { ui.add_space(8.0); ui.small(format!("Saved to {}",path.display())); }
-                    }
-                });
-            });
+                }
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Choose your printer, paper size, and copies in the print dialog.")
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+            if let Some(feedback) = &self.print_feedback {
+                ui.add_space(8.0);
+                ui.label(feedback);
+            }
         });
+        ui.add_space(12.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(inner_width);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Send photos").font(theme::editorial(21.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(theme::eyebrow("COMING SOON").size(8.0).color(theme::MUTED));
+                });
+            });
+            ui.label(
+                RichText::new("Email and text delivery are on the way.")
+                    .size(13.0)
+                    .color(theme::MUTED),
+            );
+        });
+        if !fullscreen {
+            if let Some(path) = &self.last_strip {
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(format!("Saved to {}", path.display()))
+                        .size(11.0)
+                        .color(theme::MUTED),
+                );
+            }
+        }
     }
 }
 
@@ -592,7 +1292,11 @@ impl eframe::App for SparkboothApp {
         }
 
         let mut action = HeaderAction::None;
-        if !self.booth.capture_active() {
+        // Guest fullscreen has no operator chrome; the booth page carries its
+        // own take and exit-fullscreen controls. Windowed mode keeps the header
+        // in every phase so the take button never moves under the guest's
+        // finger; the operator actions are disabled outside Preview.
+        if !fullscreen {
             egui::Panel::top("booth_header")
                 .frame(
                     egui::Frame::new()
@@ -600,17 +1304,12 @@ impl eframe::App for SparkboothApp {
                         .inner_margin(egui::Margin::symmetric(20, 14)),
                 )
                 .show(ui, |ui| {
-                    action = theme::header(
-                        ui,
-                        fullscreen,
-                        self.booth.phase() == Phase::Preview,
-                        self.show_editor,
-                    );
+                    action =
+                        theme::header(ui, self.booth.phase() == Phase::Preview, self.show_editor);
                 });
         }
         match action {
             HeaderAction::Fullscreen => self.set_fullscreen(&ctx, true),
-            HeaderAction::ExitFullscreen => self.set_fullscreen(&ctx, false),
             HeaderAction::Settings => {
                 self.show_settings = !self.show_settings;
                 self.show_editor = false;
@@ -622,7 +1321,7 @@ impl eframe::App for SparkboothApp {
             HeaderAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             HeaderAction::None => {}
         }
-        if !fullscreen && !self.booth.capture_active() {
+        if !fullscreen {
             egui::Panel::bottom("operator_status")
                 .frame(
                     egui::Frame::new()
@@ -812,18 +1511,325 @@ impl eframe::App for SparkboothApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BACKGROUND).inner_margin(
-                if self.booth.capture_active() {
-                    8
-                } else if fullscreen {
-                    24
-                } else {
-                    20
-                },
-            ))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BACKGROUND)
+                    .inner_margin(if fullscreen { 24 } else { 20 }),
+            )
             .show(ui, |ui| match self.booth.phase() {
                 Phase::Review => self.review_page(ui, fullscreen),
-                _ => self.booth_page(ui),
+                _ => self.booth_page(ui, fullscreen),
             });
+    }
+}
+
+#[cfg(test)]
+mod session_edit_tests {
+    use super::*;
+    use image::{GenericImageView, Rgba, RgbaImage};
+
+    fn app(name: &str) -> (egui::Context, SparkboothApp, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "radiate-session-edit-{}-{name}",
+            std::process::id()
+        ));
+        let ctx = egui::Context::default();
+        let mut app = SparkboothApp::from_context(&ctx, true, Some(dir.join("settings.toml")));
+        app.settings.output_dir = dir.clone();
+        app.settings.shots = 3;
+        app.settings.countdown_seconds = 1;
+        app.reload_booth_if_idle();
+        (ctx, app, dir)
+    }
+
+    fn capture(app: &mut SparkboothApp, ctx: &egui::Context, color: [u8; 4]) {
+        app.request_picture();
+        assert!(matches!(app.booth.update(1000), BoothEvent::ShotDue { .. }));
+        app.accept_capture(
+            ctx,
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(16, 12, Rgba(color))),
+        );
+    }
+
+    fn shot_colors(app: &SparkboothApp) -> Vec<[u8; 4]> {
+        app.shots
+            .iter()
+            .map(|photo| photo.get_pixel(0, 0).0)
+            .collect()
+    }
+
+    fn assert_print_order(app: &SparkboothApp, expected: &[[u8; 4]]) {
+        let print = app.print_image.as_ref().expect("printable layout");
+        let saved = image::open(app.last_strip.as_ref().expect("saved layout")).unwrap();
+        for (index, color) in expected.iter().enumerate() {
+            let y = 46 + index as u32 * 494;
+            assert_eq!(print.get_pixel(46, y).0, *color);
+            let actual = saved.get_pixel(46, y).0;
+            for channel in 0..3 {
+                assert!(
+                    actual[channel].abs_diff(color[channel]) <= 4,
+                    "saved layout order differs from print"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retake_mid_session_preserves_other_photos_on_cancel_failure_and_success() {
+        let (ctx, mut app, dir) = app("partial");
+        let red = [220, 20, 20, 255];
+        let green = [20, 220, 20, 255];
+        capture(&mut app, &ctx, red);
+        capture(&mut app, &ctx, green);
+        let textures: Vec<_> = app.shot_textures.iter().map(TextureHandle::id).collect();
+        app.request_retake(0);
+        assert!(app.booth.cancel_retake());
+        assert_eq!(shot_colors(&app), vec![red, green]);
+        app.request_retake(0);
+        app.booth.update(1000);
+        let (tx, rx) = mpsc::channel();
+        app.capture_rx = Some(rx);
+        tx.send(Err("camera disconnected".into())).unwrap();
+        app.drain_capture(&ctx);
+        assert_eq!(app.booth.phase(), Phase::Ready);
+        assert_eq!(shot_colors(&app), vec![red, green]);
+        assert_eq!(
+            app.shot_textures
+                .iter()
+                .map(TextureHandle::id)
+                .collect::<Vec<_>>(),
+            textures
+        );
+        assert!(app
+            .capture_error
+            .as_deref()
+            .unwrap()
+            .contains("disconnected"));
+        app.selected_capture = Some(0);
+        let blue = [20, 20, 220, 255];
+        capture(&mut app, &ctx, blue);
+        assert_eq!(shot_colors(&app), vec![blue, green]);
+        assert_eq!(app.shot_textures[1].id(), textures[1]);
+        assert_eq!(app.booth.shots_taken(), 2);
+        assert!(!app.reorder_photos(&ctx, PhotoReorder::Move, 0, 1));
+        capture(&mut app, &ctx, red);
+        assert_eq!(app.booth.phase(), Phase::Review);
+        assert_print_order(&app, &[blue, green, red]);
+        app.reset_session();
+        assert!(app.shots.is_empty());
+        assert!(app.shot_textures.is_empty());
+        assert_eq!(app.selected_capture, None);
+        assert_eq!(app.last_capture, None);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reorder_then_retake_updates_the_same_slot_in_thumbnails_saved_layout_and_print() {
+        let (ctx, mut app, dir) = app("review");
+        let colors = [[220, 20, 20, 255], [20, 220, 20, 255], [20, 20, 220, 255]];
+        for color in colors {
+            capture(&mut app, &ctx, color);
+        }
+        let original_path = app.last_strip.clone().unwrap();
+        let original_bytes = std::fs::read(&original_path).unwrap();
+        let textures: Vec<_> = app.shot_textures.iter().map(TextureHandle::id).collect();
+        assert!(app.reorder_photos(&ctx, PhotoReorder::Move, 0, 2));
+        assert_eq!(shot_colors(&app), vec![colors[1], colors[2], colors[0]]);
+        assert_eq!(
+            app.shot_textures
+                .iter()
+                .map(TextureHandle::id)
+                .collect::<Vec<_>>(),
+            vec![textures[1], textures[2], textures[0]]
+        );
+        assert_eq!(app.review_selection, 3);
+        assert_print_order(&app, &[colors[1], colors[2], colors[0]]);
+        assert!(app.reorder_photos(&ctx, PhotoReorder::Move, 2, 0));
+        assert_print_order(&app, &colors);
+        assert!(!app.reorder_photos(&ctx, PhotoReorder::Move, 0, 3));
+        assert!(!app.reorder_photos(&ctx, PhotoReorder::Move, 3, 0));
+        assert!(!app.reorder_photos(&ctx, PhotoReorder::Move, 1, 1));
+        app.request_retake(1);
+        assert!(app.booth.cancel_retake());
+        assert_eq!(app.booth.phase(), Phase::Review);
+        assert_print_order(&app, &colors);
+        app.request_retake(1);
+        app.booth.update(1000);
+        let (tx, rx) = mpsc::channel();
+        app.capture_rx = Some(rx);
+        tx.send(Err("capture failed".into())).unwrap();
+        app.drain_capture(&ctx);
+        assert_eq!(app.booth.phase(), Phase::Review);
+        assert_print_order(&app, &colors);
+        app.request_retake(1);
+        assert!(!app.reorder_photos(&ctx, PhotoReorder::Move, 0, 1));
+        app.booth.update(1000);
+        let yellow = [220, 220, 20, 255];
+        app.accept_capture(
+            &ctx,
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(16, 12, Rgba(yellow))),
+        );
+        assert_eq!(app.booth.phase(), Phase::Review);
+        assert_eq!(app.booth.shots_taken(), 3);
+        assert_eq!(shot_colors(&app), vec![colors[0], yellow, colors[2]]);
+        assert_eq!(app.shot_textures[0].id(), textures[0]);
+        assert_eq!(app.shot_textures[2].id(), textures[2]);
+        assert_print_order(&app, &[colors[0], yellow, colors[2]]);
+        assert_eq!(std::fs::read(original_path).unwrap(), original_bytes);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn dragging_on_template_swaps_photos_and_ignores_cancelled_or_invalid_drops() {
+        let (ctx, mut app, dir) = app("drag");
+        let colors = [[220, 20, 20, 255], [20, 220, 20, 255], [20, 20, 220, 255]];
+        for color in colors {
+            capture(&mut app, &ctx, color);
+        }
+        let rect = egui::Rect::from_min_size(egui::pos2(80.0, 40.0), Vec2::new(356.0, 770.0));
+        let center = |index: usize| {
+            egui::pos2(
+                rect.center().x,
+                rect.top() + (276.0 + index as f32 * 494.0) / 2.0,
+            )
+        };
+        let first = center(0);
+        let last = center(2);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut time = 0.0;
+        let mut frame = |app: &mut SparkboothApp, events| {
+            time += 0.05;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1024.0, 1000.0),
+                    )),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| app.interact_template(ui, rect));
+                },
+            );
+            // This headless check intentionally does not send textures to a GPU.
+            output.textures_delta.clear();
+        };
+        frame(&mut app, vec![]);
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(first), button(first, true)],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(first + Vec2::new(20.0, 0.0))],
+        );
+        assert!(egui::DragAndDrop::has_payload_of_type::<DraggedPhoto>(&ctx));
+        assert_eq!(shot_colors(&app), colors);
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(last), button(last, false)],
+        );
+        assert_eq!(shot_colors(&app), [colors[2], colors[1], colors[0]]);
+        assert_print_order(&app, &[colors[2], colors[1], colors[0]]);
+        assert_eq!(app.review_selection, 0);
+        let saved = app.last_strip.clone();
+        // Releasing over the frame's margin must not reorder anything.
+        let margin = rect.min + Vec2::splat(2.0);
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(first), button(first, true)],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(first + Vec2::new(20.0, 0.0))],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(margin), button(margin, false)],
+        );
+        assert_eq!(app.last_strip, saved);
+        // Escape cancels a drag even if the pointer is subsequently released on a photo.
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(first), button(first, true)],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(first + Vec2::new(20.0, 0.0))],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(last), button(last, false)],
+        );
+        assert_eq!(app.last_strip, saved);
+        assert_eq!(shot_colors(&app), [colors[2], colors[1], colors[0]]);
+        assert!(!egui::DragAndDrop::has_payload_of_type::<DraggedPhoto>(
+            &ctx
+        ));
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn template_targets_follow_letterboxing_rotation_visibility_and_repeated_slots() {
+        use crate::design::{Frame, Layer};
+        let (ctx, mut app, dir) = app("regions");
+        let colors = [[220, 20, 20, 255], [20, 220, 20, 255], [20, 20, 220, 255]];
+        for color in colors {
+            capture(&mut app, &ctx, color);
+        }
+        let mut template = Template::builtin(false);
+        template.width = 300;
+        template.height = 200;
+        let rotated = Frame {
+            rotation: 45.0,
+            ..Frame::new(100.0, 20.0, 60.0, 40.0)
+        };
+        let mut hidden = Layer::photo(Frame::new(0.0, 0.0, 300.0, 200.0), 2);
+        hidden.visible = false;
+        template.layers = vec![
+            Layer::photo(Frame::new(10.0, 10.0, 60.0, 50.0), 0),
+            Layer::photo(Frame::new(10.0, 100.0, 60.0, 50.0), 0),
+            Layer::photo(rotated, 1),
+            hidden,
+        ];
+        app.session_template = Some(template);
+        app.compose_and_save(&ctx);
+        let rect = egui::Rect::from_min_size(egui::pos2(80.0, 120.0), Vec2::new(600.0, 400.0));
+        let point = |x: f32, y: f32| rect.min + Vec2::new(x, y) * 2.0;
+        assert_eq!(app.template_photo_at(rect, point(40.0, 35.0)), Some(0));
+        assert_eq!(app.template_photo_at(rect, point(40.0, 125.0)), Some(0));
+        assert_eq!(app.template_photo_at(rect, point(107.0, 55.0)), Some(1));
+        // A point in the rotated bounding box, but outside the actual photo.
+        assert_eq!(app.template_photo_at(rect, point(75.0, 22.0)), None);
+        assert_eq!(
+            app.template_photo_at(rect, rect.min - Vec2::splat(1.0)),
+            None
+        );
+        assert!(app.reorder_photos(&ctx, PhotoReorder::Swap, 0, 1));
+        let image = app.print_image.as_ref().unwrap();
+        assert_eq!(image.get_pixel(40, 35).0, colors[1]);
+        assert_eq!(image.get_pixel(40, 125).0, colors[1]);
+        assert_eq!(image.get_pixel(107, 55).0, colors[0]);
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -39,6 +39,7 @@ pub struct Booth {
     phase: Phase,
     shots_taken: u32,
     elapsed_ms: u64,
+    retake_index: Option<u32>,
 }
 
 impl Booth {
@@ -49,6 +50,7 @@ impl Booth {
             phase: Phase::Preview,
             shots_taken: 0,
             elapsed_ms: 0,
+            retake_index: None,
         }
     }
 
@@ -64,15 +66,47 @@ impl Booth {
         self.shots_wanted
     }
 
-    pub fn capture_active(&self) -> bool {
-        matches!(
-            self.phase,
-            Phase::Ready | Phase::Countdown | Phase::Shooting
-        )
-    }
-
     pub fn ready_for_picture(&self) -> bool {
         matches!(self.phase, Phase::Preview | Phase::Ready)
+    }
+
+    /// The destination of the next frame, whether new or replacing an old shot.
+    pub fn capture_index(&self) -> u32 {
+        self.retake_index.unwrap_or(self.shots_taken)
+    }
+
+    pub fn retaking_index(&self) -> Option<u32> {
+        self.retake_index
+    }
+
+    /// Start a replacement countdown without discarding the original photo.
+    pub fn request_retake(&mut self, index: u32) -> bool {
+        if !matches!(self.phase, Phase::Ready | Phase::Review) || index >= self.shots_taken {
+            return false;
+        }
+        self.retake_index = Some(index);
+        self.elapsed_ms = 0;
+        self.phase = Phase::Countdown;
+        true
+    }
+
+    /// A guest may keep the original until capture has actually started.
+    pub fn cancel_retake(&mut self) -> bool {
+        if self.phase != Phase::Countdown || self.retake_index.is_none() {
+            return false;
+        }
+        self.return_from_retake();
+        true
+    }
+
+    fn return_from_retake(&mut self) {
+        self.retake_index = None;
+        self.elapsed_ms = 0;
+        self.phase = if self.shots_taken >= self.shots_wanted {
+            Phase::Review
+        } else {
+            Phase::Ready
+        };
     }
 
     /// Milliseconds left in the current countdown (0 outside Countdown).
@@ -108,7 +142,7 @@ impl Booth {
                 if self.elapsed_ms >= self.countdown_ms {
                     self.phase = Phase::Shooting;
                     BoothEvent::ShotDue {
-                        index: self.shots_taken,
+                        index: self.capture_index(),
                     }
                 } else {
                     BoothEvent::None
@@ -124,7 +158,9 @@ impl Booth {
         if self.phase != Phase::Shooting {
             return BoothEvent::None;
         }
-        self.shots_taken += 1;
+        if self.retake_index.take().is_none() {
+            self.shots_taken += 1;
+        }
         if self.shots_taken >= self.shots_wanted {
             self.phase = Phase::Review;
             BoothEvent::StripComplete
@@ -138,13 +174,13 @@ impl Booth {
     /// Keep completed photos and allow the pending shot to be retried.
     pub fn capture_failed(&mut self) {
         if self.phase == Phase::Shooting {
-            self.phase = Phase::Ready;
-            self.elapsed_ms = 0;
+            self.return_from_retake();
         }
     }
 
     /// Abandon the session and go back to Preview (clears captured shots).
-    pub fn retake(&mut self) {
+    fn reset(&mut self) {
+        self.retake_index = None;
         self.shots_taken = 0;
         self.elapsed_ms = 0;
         self.phase = Phase::Preview;
@@ -152,7 +188,7 @@ impl Booth {
 
     /// After the strip has been shown/saved, reset for the next guest.
     pub fn finish(&mut self) {
-        self.retake();
+        self.reset();
     }
 }
 
@@ -211,13 +247,13 @@ mod tests {
     }
 
     #[test]
-    fn retake_from_review_resets() {
+    fn finish_from_review_resets() {
         let mut booth = Booth::new(1, 1);
         booth.request_shot();
         step(&mut booth, 1000, 1);
         booth.deliver_shot();
         assert_eq!(booth.phase(), Phase::Review);
-        booth.retake();
+        booth.finish();
         assert_eq!(booth.phase(), Phase::Preview);
         assert_eq!(booth.shots_taken(), 0);
     }
@@ -257,12 +293,59 @@ mod tests {
         booth.capture_failed();
         assert_eq!(booth.shots_taken(), 1);
         assert_eq!(booth.phase(), Phase::Ready);
-        assert!(booth.capture_active());
         assert!(booth.ready_for_picture());
         booth.request_shot();
         assert_eq!(booth.update(3000), BoothEvent::ShotDue { index: 1 });
         assert_eq!(booth.deliver_shot(), BoothEvent::StripComplete);
         booth.request_shot();
         assert_eq!(booth.phase(), Phase::Review);
+    }
+    #[test]
+    fn retake_replaces_the_selected_slot_and_keeps_session_progress() {
+        let mut booth = Booth::new(3, 1);
+        for index in 0..2 {
+            booth.request_shot();
+            assert_eq!(booth.update(1000), BoothEvent::ShotDue { index });
+            booth.deliver_shot();
+        }
+        assert!(booth.request_retake(0));
+        assert_eq!(booth.update(1000), BoothEvent::ShotDue { index: 0 });
+        assert_eq!(booth.capture_index(), 0);
+        assert_eq!(booth.deliver_shot(), BoothEvent::None);
+        assert_eq!(booth.shots_taken(), 2);
+        booth.request_shot();
+        assert_eq!(booth.update(1000), BoothEvent::ShotDue { index: 2 });
+        assert_eq!(booth.deliver_shot(), BoothEvent::StripComplete);
+        assert!(booth.request_retake(1));
+        assert_eq!(booth.update(1000), BoothEvent::ShotDue { index: 1 });
+        assert_eq!(booth.deliver_shot(), BoothEvent::StripComplete);
+        assert_eq!(booth.shots_taken(), 3);
+    }
+
+    #[test]
+    fn cancelled_failed_and_busy_retakes_keep_the_existing_session() {
+        let mut booth = Booth::new(1, 1);
+        assert!(!booth.request_retake(0));
+        booth.request_shot();
+        booth.update(1000);
+        booth.deliver_shot();
+        assert!(!booth.request_retake(1));
+        assert!(booth.request_retake(0));
+        assert!(booth.cancel_retake());
+        assert_eq!(booth.phase(), Phase::Review);
+        assert!(booth.request_retake(0));
+        booth.update(400);
+        assert!(!booth.request_retake(0));
+        assert_eq!(booth.remaining_ms(), 600);
+        booth.update(600);
+        assert!(!booth.cancel_retake());
+        booth.capture_failed();
+        assert_eq!(booth.phase(), Phase::Review);
+        assert_eq!(booth.shots_taken(), 1);
+        assert_eq!(booth.retaking_index(), None);
+        assert!(booth.request_retake(0));
+        booth.finish();
+        assert_eq!(booth.shots_taken(), 0);
+        assert_eq!(booth.retaking_index(), None);
     }
 }
